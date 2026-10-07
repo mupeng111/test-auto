@@ -1,0 +1,1 @@
+{"dependencies":{"playwright":"^1.49.0"},"name":"axent-claim","private":true,"scripts":{"claim":"node claim.mjs"},"type":"module","version":"1.0.0"}
