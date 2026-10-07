@@ -4,7 +4,20 @@
 
 function parseVmess(link) {
   const b64 = link.replace('vmess://', '');
-  const j = JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
+  // pad base64 if needed (handle base64url too)
+  const norm = b64.replace(/-/g, '+').replace(/_/g, '/');
+  const padded = norm + '='.repeat((4 - (norm.length % 4)) % 4);
+  const decoded = Buffer.from(padded, 'base64').toString('utf8');
+  let j;
+  try {
+    j = JSON.parse(decoded);
+  } catch {
+    // fallback: "security:uuid@host:port" or "uuid@host:port" plain format
+    const m = decoded.match(/^(?:(\w+):)?([0-9a-f-]{36})@([^:]+):(\d+)$/i);
+    if (!m) throw new Error('unrecognized vmess payload: ' + decoded.slice(0, 60));
+    const [, sec, uuid, host, port] = m;
+    j = { add: host, port, id: uuid, aid: '0', scy: sec && sec !== 'none' ? sec : 'auto', net: 'tcp', tls: parseInt(port) === 443 ? 'tls' : '' };
+  }
   const ob = { type: 'vmess', server: j.add, server_port: parseInt(j.port), uuid: j.id, security: j.scy || 'auto', alter_id: parseInt(j.aid || '0') };
   applyTransport(ob, j);
   return ob;
