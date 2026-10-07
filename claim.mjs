@@ -162,23 +162,37 @@ async function claimOnce(browser) {
     headless: true,
     args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'],
   };
-  if (PROXY_SERVER) {
+  let useProxy = !!PROXY_SERVER;
+  if (useProxy) {
     launchOpts.proxy = { server: PROXY_SERVER };
     console.log('[proxy] using', PROXY_SERVER);
   } else {
     console.log('[proxy] direct connection (no PROXY_SERVER set)');
   }
-  const browser = await chromium.launch(launchOpts);
-  let result = { ok: false, reason: 'not-run' };
-  for (let i = 0; i < MAX_ATTEMPTS; i++) {
-    console.log(`[run] attempt ${i + 1}/${MAX_ATTEMPTS}`);
-    result = await claimOnce(browser);
-    console.log('[run] result:', JSON.stringify(result));
-    if (result.ok) break;
-    if (result.reason === 'cooldown-or-already-claimed') break;
-    await sleep(15000);
+
+  async function runOnce() {
+    const browser = await chromium.launch(launchOpts);
+    let result = { ok: false, reason: 'not-run' };
+    for (let i = 0; i < MAX_ATTEMPTS; i++) {
+      console.log(`[run] attempt ${i + 1}/${MAX_ATTEMPTS}`);
+      result = await claimOnce(browser);
+      console.log('[run] result:', JSON.stringify(result));
+      if (result.ok) break;
+      if (result.reason === 'cooldown-or-already-claimed') break;
+      await sleep(15000);
+    }
+    await browser.close();
+    return result;
   }
-  await browser.close();
+
+  let result = await runOnce();
+  // fallback: if proxy failed with network errors, retry direct
+  if (!result.ok && useProxy && /ERR_CONNECTION|ERR_PROXY|net::ERR/i.test(result.reason || '')) {
+    console.log('[proxy] proxy failed, falling back to direct connection');
+    delete launchOpts.proxy;
+    useProxy = false;
+    result = await runOnce();
+  }
   console.log('FINAL:', JSON.stringify(result));
   if (!result.ok && result.reason !== 'cooldown-or-already-claimed') process.exitCode = 1;
 })();
