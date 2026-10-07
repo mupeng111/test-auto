@@ -14,6 +14,19 @@ jobs:
           node-version: 20
       - run: npm install
       - run: npx playwright install chromium --with-deps
+      - name: setup sing-box proxy
+        if: ${{ secrets.PROXY_URL != '' }}
+        env:
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+        run: |
+          SB_VER=1.11.4
+          curl -sL -o sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-amd64.tar.gz"
+          tar xzf sb.tar.gz
+          node setup-proxy.mjs > sb-config.json
+          ./sing-box-${SB_VER}-linux-amd64/sing-box run -c sb-config.json &
+          echo "waiting for proxy..."
+          for i in $(seq 1 20); do (echo > /dev/tcp/127.0.0.1/1080) 2>/dev/null && break; sleep 1; done
+          echo "PROXY_SERVER=socks5://127.0.0.1:1080" >> $GITHUB_ENV
       - name: claim credits
         env:
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
