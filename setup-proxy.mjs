@@ -18,7 +18,8 @@ function parseVmess(link) {
       .replace(/[\u0000-\u001F\u007F-\u009F\u200B-\u200D\uFEFF]/g, '')
       .replace(/[\u2010-\u2015\u2212]/g, '-')
       .trim();
-    const m = clean.match(/^(?:(\w+):)?([^@\s]+)@([^:\s]+):(\d+)$/);
+    // match at start only; ignore any trailing garbage after the port
+    const m = clean.match(/^(?:(\w+):)?([^@\s]+)@([^:\s]+):(\d+)/);
     if (!m) throw new Error('unrecognized vmess payload: ' + clean.slice(0, 60));
     const [, sec, uuid, host, port] = m;
     j = { add: host, port, id: uuid, aid: '0', scy: sec && sec !== 'none' ? sec : 'auto', net: 'tcp', tls: parseInt(port) === 443 ? 'tls' : '' };
