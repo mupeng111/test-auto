@@ -7,6 +7,7 @@ import { chromium } from 'playwright';
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const DISCORD_EMAIL = process.env.DISCORD_EMAIL;
 const DISCORD_PASSWORD = process.env.DISCORD_PASSWORD;
+const PROXY_SERVER = process.env.PROXY_SERVER || ''; // e.g. socks5://127.0.0.1:1080 (via sing-box)
 const CLAIM_URL = 'https://app.axenthost.com/credits';
 const MAX_ATTEMPTS = 3;
 
@@ -157,10 +158,17 @@ async function claimOnce(browser) {
 }
 
 (async () => {
-  const browser = await chromium.launch({
+  const launchOpts = {
     headless: true,
     args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'],
-  });
+  };
+  if (PROXY_SERVER) {
+    launchOpts.proxy = { server: PROXY_SERVER };
+    console.log('[proxy] using', PROXY_SERVER);
+  } else {
+    console.log('[proxy] direct connection (no PROXY_SERVER set)');
+  }
+  const browser = await chromium.launch(launchOpts);
   let result = { ok: false, reason: 'not-run' };
   for (let i = 0; i < MAX_ATTEMPTS; i++) {
     console.log(`[run] attempt ${i + 1}/${MAX_ATTEMPTS}`);
