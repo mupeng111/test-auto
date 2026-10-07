@@ -15,10 +15,13 @@ jobs:
       - run: npm install
       - run: npx playwright install chromium --with-deps
       - name: setup sing-box proxy
-        if: secrets.PROXY_URL != ''
         env:
           PROXY_URL: ${{ secrets.PROXY_URL }}
         run: |
+          if [ -z "$PROXY_URL" ]; then
+            echo "PROXY_URL secret not set, skipping proxy setup"
+            exit 0
+          fi
           SB_VER=1.11.4
           curl -sL -o sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-amd64.tar.gz"
           tar xzf sb.tar.gz
