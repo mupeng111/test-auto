@@ -13,8 +13,9 @@ function parseVmess(link) {
     j = JSON.parse(decoded);
   } catch {
     // fallback: "security:uuid@host:port" or "uuid@host:port" plain format
-    const m = decoded.match(/^(?:(\w+):)?([0-9a-f-]{36})@([^:]+):(\d+)$/i);
-    if (!m) throw new Error('unrecognized vmess payload: ' + decoded.slice(0, 60));
+    const clean = decoded.trim();
+    const m = clean.match(/^(?:(\w+):)?([0-9a-f-]{36})@([^:\s]+):(\d+)$/i);
+    if (!m) throw new Error('unrecognized vmess payload: ' + clean.slice(0, 60));
     const [, sec, uuid, host, port] = m;
     j = { add: host, port, id: uuid, aid: '0', scy: sec && sec !== 'none' ? sec : 'auto', net: 'tcp', tls: parseInt(port) === 443 ? 'tls' : '' };
   }
