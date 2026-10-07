@@ -13,8 +13,12 @@ function parseVmess(link) {
     j = JSON.parse(decoded);
   } catch {
     // fallback: "security:uuid@host:port" or "uuid@host:port" plain format
-    const clean = decoded.trim();
-    const m = clean.match(/^(?:(\w+):)?([0-9a-f-]{36})@([^:\s]+):(\d+)$/i);
+    // aggressively strip invisible chars (zero-width spaces, BOM, control chars, fancy hyphens)
+    let clean = decoded
+      .replace(/[\u0000-\u001F\u007F-\u009F\u200B-\u200D\uFEFF]/g, '')
+      .replace(/[\u2010-\u2015\u2212]/g, '-')
+      .trim();
+    const m = clean.match(/^(?:(\w+):)?([^@\s]+)@([^:\s]+):(\d+)$/);
     if (!m) throw new Error('unrecognized vmess payload: ' + clean.slice(0, 60));
     const [, sec, uuid, host, port] = m;
     j = { add: host, port, id: uuid, aid: '0', scy: sec && sec !== 'none' ? sec : 'auto', net: 'tcp', tls: parseInt(port) === 443 ? 'tls' : '' };
