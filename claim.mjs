@@ -25,7 +25,6 @@ async function takeScreenshot(page, name) {
   }
 }
 
-// 模拟 ESC 或轻量清理弹窗（不破坏反广告逻辑）
 async function dismissAdModals(page) {
   try {
     await page.keyboard.press('Escape');
@@ -39,7 +38,7 @@ async function dismissAdModals(page) {
 async function waitAndSolveTurnstile(page, attemptIndex) {
   console.log('[turnstile] waiting for verification...');
 
-  // 1. 等待可能的前置倒计时 (Verifying you're human in 0:0X)
+  // 1. 等待倒计时 (如 Verifying you're human in 0:0X)
   for (let i = 0; i < 10; i++) {
     const isCountingDown = await page.evaluate(() => {
       return document.body.innerText.includes("Verifying you're human in");
@@ -50,17 +49,24 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
     await sleep(2000);
   }
 
-  // 2. 物理坐标点击并轮询通过状态
+  let hasClicked = false;
+
+  // 2. 轮询检测并通过模拟鼠标点击完成验证
   for (let i = 0; i < 15; i++) {
     await dismissAdModals(page);
 
-    // 检查是否已通过（出现绿勾或成功提示）
-    const isVerified = await page.evaluate(() => {
+    // 检查底层的 cf-turnstile-response 是否已经生成
+    const hasToken = await page.evaluate(() => {
+      const input = document.querySelector('input[name*="turnstile-response"]');
+      return !!(input && input.value && input.value.length > 20);
+    }).catch(() => false);
+
+    // 检查前端提示与按钮状态
+    const isVerifiedText = await page.evaluate(() => {
       const text = document.body.innerText;
       return text.includes('Verified, you are human') || text.includes('成功！');
     }).catch(() => false);
 
-    // 检查按钮是否已激活（非 disabled 且不包含 Securing 提示）
     const isBtnReady = await page.evaluate(() => {
       const btn = Array.from(document.querySelectorAll('button')).find((b) =>
         b.textContent.includes('Claim 3 credits')
@@ -69,21 +75,57 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
       return btn && !btn.disabled && !isSecuring;
     }).catch(() => false);
 
-    if (isVerified || isBtnReady) {
+    if (hasToken || isVerifiedText || isBtnReady) {
       console.log('[turnstile] verification passed successfully!');
       await takeScreenshot(page, `attempt${attemptIndex}-turnstile-passed`);
       return true;
     }
 
-    // 尝试直接通过物理鼠标坐标点击 Turnstile iframe
-    const cfFrameElement = page.locator('iframe[src*="challenges.cloudflare.com"]').first();
-    if (await cfFrameElement.isVisible().catch(() => false)) {
-      const box = await cfFrameElement.boundingBox();
-      if (box) {
-        // 复选框通常在 iframe 的偏左侧垂直居中位置 (x 偏移 28-32px 处)
-        console.log(`[turnstile] clicking checkbox at (${box.x + 30}, ${box.y + box.height / 2})`);
-        await page.mouse.click(box.x + 30, box.y + box.height / 2);
+    // 遍历所有 iframe，寻找尺寸匹配的真实 Turnstile 区域
+    let targetBox = null;
+    for (const frame of page.frames()) {
+      const url = frame.url();
+      if (url.includes('challenges.cloudflare.com') || url.includes('turnstile')) {
+        const frameEl = await frame.frameElement().catch(() => null);
+        if (frameEl) {
+          const box = await frameEl.boundingBox().catch(() => null);
+          if (box && box.width > 80 && box.height > 25) {
+            targetBox = box;
+            break;
+          }
+        }
       }
+    }
+
+    // 若通过 frames 没找到，备选使用页面 selector 查找
+    if (!targetBox) {
+      const iframes = await page.locator('iframe').all();
+      for (const el of iframes) {
+        const box = await el.boundingBox().catch(() => null);
+        if (box && box.width > 200 && box.height > 40 && box.height < 150) {
+          targetBox = box;
+          break;
+        }
+      }
+    }
+
+    // 找到目标并且未点击时触发点击
+    if (targetBox && !hasClicked) {
+      const clickX = targetBox.x + 35;
+      const clickY = targetBox.y + targetBox.height / 2;
+      console.log(`[turnstile] found widget (${Math.round(targetBox.width)}x${Math.round(targetBox.height)}), clicking checkbox at (${Math.round(clickX)}, ${Math.round(clickY)})`);
+
+      // 拟真鼠标轨迹：平滑移入 -> 悬停 -> 点击
+      await page.mouse.move(clickX - 40, clickY, { steps: 5 });
+      await sleep(150);
+      await page.mouse.move(clickX, clickY, { steps: 5 });
+      await sleep(150);
+      await page.mouse.down();
+      await sleep(80);
+      await page.mouse.up();
+
+      hasClicked = true;
+      console.log('[turnstile] checkbox click dispatched');
     }
 
     await sleep(3000);
@@ -109,7 +151,7 @@ async function claimOnce(context, attemptIndex) {
       return { ok: false, reason: 'cookies-expired-or-not-logged-in' };
     }
 
-    // 检查右侧统计卡片是否处于冷却中（需包含明确的时间数字，如 45:14）
+    // 检查冷却状态
     const isCooling = await page.evaluate(() => {
       const refillMatch = document.body.innerText.match(/Claims refill in\s*(\d+:\d+)/i);
       return refillMatch ? refillMatch[1] : null;
@@ -121,13 +163,12 @@ async function claimOnce(context, attemptIndex) {
       return { ok: false, reason: 'cooldown-or-already-claimed' };
     }
 
-    // 处理 Turnstile
-    const verified = await waitAndSolveTurnstile(page, attemptIndex);
+    // 处理 Turnstile 验证
+    await waitAndSolveTurnstile(page, attemptIndex);
 
-    // 定位 Claim 3 credits 按钮
+    // 轮询等待 Claim 3 credits 按钮解除 disabled
     const claim3Btn = page.locator('button:has-text("Claim 3 credits")').first();
 
-    // 确保按钮变为可用状态（Enabled）
     const isEnabled = await page.waitForFunction(() => {
       const btn = Array.from(document.querySelectorAll('button')).find((b) =>
         b.textContent.includes('Claim 3 credits')
@@ -142,7 +183,7 @@ async function claimOnce(context, attemptIndex) {
       return { ok: false, reason: 'button-disabled-verification-failed' };
     }
 
-    // 正常激活后点击
+    // 点击领取
     await claim3Btn.click({ timeout: 5000 });
     console.log('[claim] successfully clicked Claim 3 credits button');
     await sleep(5000);
@@ -155,7 +196,6 @@ async function claimOnce(context, attemptIndex) {
       return { ok: true, balance: match ? match[1] : 'unknown' };
     }
 
-    // 检查点击后是否立刻进入了冷却计时
     const afterRefill = resultText.match(/Claims refill in\s*(\d+:\d+)/i);
     if (afterRefill) {
       return { ok: true, reason: 'claimed-now-cooling', cooldown: afterRefill[1] };
@@ -193,7 +233,27 @@ async function claimOnce(context, attemptIndex) {
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   });
 
-  // 1. 注入 LocalStorage
+  // 注入反反爬特征伪装（Stealth）
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', {
+      get: () => undefined,
+    });
+    window.chrome = { runtime: {} };
+    Object.defineProperty(navigator, 'languages', {
+      get: () => ['en-US', 'en'],
+    });
+    Object.defineProperty(navigator, 'plugins', {
+      get: () => [1, 2, 3, 4, 5],
+    });
+    const getParameter = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = function (parameter) {
+      if (parameter === 37445) return 'Google Inc. (NVIDIA)';
+      if (parameter === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+      return getParameter.apply(this, [parameter]);
+    };
+  });
+
+  // 注入 LocalStorage
   if (AXENT_LOCAL_STORAGE) {
     try {
       const storage = JSON.parse(AXENT_LOCAL_STORAGE);
@@ -208,7 +268,7 @@ async function claimOnce(context, attemptIndex) {
     }
   }
 
-  // 2. 注入 Cookies
+  // 注入 Cookies
   if (AXENT_COOKIES) {
     try {
       const parsed = JSON.parse(AXENT_COOKIES);
