@@ -31,10 +31,8 @@ jobs:
           tar xzf sb.tar.gz
           node setup-proxy.mjs > sb-config.json
 
-          # 启动 sing-box 并将日志写入 sing-box.log
           ./sing-box-${SB_VER}-linux-amd64/sing-box run -c sb-config.json > sing-box.log 2>&1 &
           
-          # 等待本地端口监听
           echo "waiting for proxy port..."
           node -e "
             const net = require('net');
@@ -49,7 +47,6 @@ jobs:
             check(20);
           "
 
-          # 增加代理连通性测试
           echo "Testing proxy connection to external network..."
           if curl -s -m 10 --socks5 127.0.0.1:1080 https://api.ipify.org; then
             echo -e "\nProxy connection successful!"
@@ -66,3 +63,11 @@ jobs:
           AXENT_LOCAL_STORAGE: ${{ secrets.AXENT_LOCAL_STORAGE }}
           PROXY_SERVER: ${{ env.PROXY_SERVER }}
         run: node claim.mjs
+
+      - name: upload debug screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: claim-debug-screenshots
+          path: screenshots/
+          retention-days: 1
