@@ -38,34 +38,25 @@ async function dismissAdModals(page) {
 async function waitAndSolveTurnstile(page, attemptIndex) {
   console.log('[turnstile] waiting for verification...');
 
-  // 1. 等待可能存在的倒计时 (Verifying you're human in 0:0X)
-  for (let i = 0; i < 8; i++) {
+  // 1. 等待倒计时结束
+  for (let i = 0; i < 10; i++) {
     const isCountingDown = await page.evaluate(() => {
       return document.body.innerText.includes("Verifying you're human in");
     }).catch(() => false);
-
     if (!isCountingDown) break;
-    console.log('[turnstile] waiting for countdown timer to finish...');
     await sleep(2000);
   }
 
-  // 2. 轮询并持续重试点击，直到验证通过
+  // 2. 轮询并执行点击
   for (let i = 0; i < 15; i++) {
     await dismissAdModals(page);
 
-    // 检查隐藏表单是否已生成 Token
+    // 检查是否已通过（存在验证 Token 或已激活按钮）
     const hasToken = await page.evaluate(() => {
       const input = document.querySelector('input[name*="turnstile-response"]');
       return !!(input && input.value && input.value.length > 20);
     }).catch(() => false);
 
-    // 检查前端提示
-    const isVerifiedText = await page.evaluate(() => {
-      const text = document.body.innerText;
-      return text.includes('Verified, you are human') || text.includes('成功！');
-    }).catch(() => false);
-
-    // 检查按钮是否已就绪（排除 Securing 提示）
     const isBtnReady = await page.evaluate(() => {
       const btn = Array.from(document.querySelectorAll('button')).find((b) =>
         b.textContent.includes('Claim 3 credits')
@@ -74,33 +65,36 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
       return btn && !btn.disabled && !isSecuring;
     }).catch(() => false);
 
-    if (hasToken || isVerifiedText || isBtnReady) {
+    if (hasToken || isBtnReady) {
       console.log('[turnstile] verification passed successfully!');
       await takeScreenshot(page, `attempt${attemptIndex}-turnstile-passed`);
       return true;
     }
 
-    // 严格定位 Cloudflare 验证码 iframe（彻底过滤广告）
-    const cfFrameLocator = page.locator('iframe[src*="challenges.cloudflare.com"]:visible').first();
-    const isFrameVisible = await cfFrameLocator.isVisible().catch(() => false);
+    // 寻找包含 Turnstile 的 Frame
+    const cfFrame = page.frames().find((f) => f.url().includes('challenges.cloudflare.com'));
+    if (cfFrame) {
+      const frameElement = await cfFrame.frameElement().catch(() => null);
+      if (frameElement) {
+        const box = await frameElement.boundingBox().catch(() => null);
+        if (box && box.width >= 200 && box.width <= 380) {
+          const clickX = Math.round(box.x + 35);
+          const clickY = Math.round(box.y + box.height / 2);
+          console.log(`[turnstile] attempt ${i + 1}: clicking at (${clickX}, ${clickY})`);
 
-    if (isFrameVisible) {
-      const box = await cfFrameLocator.boundingBox().catch(() => null);
-      // 校验真实 Turnstile 尺寸（通常约为 300x65），彻底杜绝误点 970x100 等广告
-      if (box && box.width >= 200 && box.width <= 380 && box.height >= 45 && box.height <= 90) {
-        const clickX = box.x + 30;
-        const clickY = box.y + box.height / 2;
-        console.log(`[turnstile] attempt ${i + 1}: clicking checkbox at (${Math.round(clickX)}, ${Math.round(clickY)})`);
+          // 1. 尝试直接点击 frame 内部的 body 偏左区域
+          await cfFrame.locator('body').click({
+            position: { x: 35, y: Math.round(box.height / 2) },
+            timeout: 2000,
+            force: true,
+          }).catch(() => {});
 
-        // 方式一：直接在页面层派发物理点击
-        await page.mouse.click(clickX, clickY, { delay: 50 });
-
-        // 方式二：通过 Frame 内部派发点击（应对跨域 iframe 激活延迟）
-        try {
-          const fl = page.frameLocator('iframe[src*="challenges.cloudflare.com"]:visible').first();
-          await fl.locator('body').click({ position: { x: 30, y: Math.round(box.height / 2) }, timeout: 1500 });
-        } catch {}
+          // 2. 模拟外层物理鼠标点击作为兜底
+          await page.mouse.click(clickX, clickY, { delay: 60 });
+        }
       }
+    } else {
+      console.log(`[turnstile] attempt ${i + 1}: cf frame not found yet`);
     }
 
     await sleep(2500);
