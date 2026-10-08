@@ -2,6 +2,7 @@ import { chromium } from 'playwright';
 
 const PROXY_SERVER = process.env.PROXY_SERVER || '';
 const AXENT_COOKIES = process.env.AXENT_COOKIES || '';
+const AXENT_LOCAL_STORAGE = process.env.AXENT_LOCAL_STORAGE || '';
 const CREDITS_URL = 'https://app.axenthost.com/credits';
 const MAX_ATTEMPTS = 3;
 
@@ -11,7 +12,7 @@ async function waitAndSolveTurnstile(page) {
   console.log('[turnstile] waiting for verification to complete...');
 
   for (let i = 0; i < 10; i++) {
-    // 1. 尝试寻找并点击 Cloudflare 验证框
+    // 尝试寻找并点击 Cloudflare 验证框
     const frames = page.frames().filter((f) => f.url().includes('challenges.cloudflare.com'));
     if (frames.length > 0) {
       try {
@@ -23,12 +24,10 @@ async function waitAndSolveTurnstile(page) {
       } catch {}
     }
 
-    // 2. 检查验证成功的标识（出现 Verified, you are human 或 成功！）
+    // 检查验证通过标识或按钮可点状态
     const verifiedText = page.locator('text=Verified, you are human, text="成功！"');
     const hasVerified = (await verifiedText.count()) > 0;
 
-    // 3. 检查最终领取按钮是否已激活（非 disabled 状态）
-    const claimBtn = page.locator('button:has-text("Claim 3 credits")').first();
     const isReady = await page.evaluate(() => {
       const btn = Array.from(document.querySelectorAll('button')).find((b) =>
         b.textContent.includes('Claim 3 credits')
@@ -51,21 +50,22 @@ async function waitAndSolveTurnstile(page) {
 async function claimOnce(context) {
   const page = await context.newPage();
   try {
-    // 访问 credits 页面
     await page.goto(CREDITS_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await sleep(4000);
 
-    // 检查是否丢失登录态
     const currentUrl = page.url();
     const isLoginPage = currentUrl.includes('login') || (await page.locator('button:has-text("Login")').count()) > 0;
+    
+    // 如果未登录，打印出当前页面地址与标题排查具体被重定向到了哪里
     if (isLoginPage) {
+      const pageTitle = await page.title().catch(() => 'unknown');
+      console.log(`[auth-check] failed at url: ${currentUrl}, title: ${pageTitle}`);
       return { ok: false, reason: 'cookies-expired-or-not-logged-in' };
     }
 
     // 点击 Hourly Free Credits 卡片上的 Claim 按钮
     const hourlyClaimBtn = page.locator('button:has-text("Claim"), a:has-text("Claim")').first();
     if (!(await hourlyClaimBtn.count())) {
-      // 检查当前是否在冷却中
       const bodyText = (await page.textContent('body').catch(() => '')) || '';
       if (/refill in|cooldown/i.test(bodyText)) {
         return { ok: false, reason: 'cooldown-or-already-claimed' };
@@ -80,7 +80,7 @@ async function claimOnce(context) {
     // 处理 Turnstile 验证
     await waitAndSolveTurnstile(page);
 
-    // 点击 "Claim 3 credits" 按钮
+    // 点击 "Claim 3 credits"
     const claim3Btn = page.locator('button:has-text("Claim 3 credits")').first();
     if (await claim3Btn.count()) {
       await claim3Btn.click({ timeout: 5000 });
@@ -90,7 +90,7 @@ async function claimOnce(context) {
       return { ok: false, reason: 'claim-3-credits-button-not-found' };
     }
 
-    // 验证结果
+    // 检查领取结果
     const resultText = (await page.textContent('body').catch(() => '')) || '';
     if (/success|claimed|\+3/i.test(resultText)) {
       const match = resultText.match(/(\d+)\s*credits?/i);
@@ -109,10 +109,9 @@ async function claimOnce(context) {
 }
 
 (async () => {
-  const launchArgs = ['--no-sandbox', '--disable-blink-features=AutomationControlled'];
   const launchOpts = {
     headless: true,
-    args: launchArgs,
+    args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'],
   };
 
   if (PROXY_SERVER) {
@@ -126,7 +125,22 @@ async function claimOnce(context) {
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   });
 
-  // 注入 Cookies
+  // 1. 注入 LocalStorage（在页面加载前预置）
+  if (AXENT_LOCAL_STORAGE) {
+    try {
+      const storage = JSON.parse(AXENT_LOCAL_STORAGE);
+      await context.addInitScript((items) => {
+        for (const [k, v] of Object.entries(items)) {
+          window.localStorage.setItem(k, v);
+        }
+      }, storage);
+      console.log('[auth] localStorage injected successfully');
+    } catch (e) {
+      console.error('[auth] failed to parse AXENT_LOCAL_STORAGE:', e.message);
+    }
+  }
+
+  // 2. 注入 Cookies
   if (AXENT_COOKIES) {
     try {
       const parsed = JSON.parse(AXENT_COOKIES);
@@ -145,8 +159,6 @@ async function claimOnce(context) {
     } catch (e) {
       console.error('[auth] failed to parse AXENT_COOKIES:', e.message);
     }
-  } else {
-    console.warn('[auth] AXENT_COOKIES not provided!');
   }
 
   let result = { ok: false, reason: 'not-run' };
