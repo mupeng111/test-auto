@@ -63,5 +63,6 @@ jobs:
       - name: claim credits
         env:
           AXENT_COOKIES: ${{ secrets.AXENT_COOKIES }}
+          AXENT_LOCAL_STORAGE: ${{ secrets.AXENT_LOCAL_STORAGE }}
           PROXY_SERVER: ${{ env.PROXY_SERVER }}
         run: node claim.mjs
