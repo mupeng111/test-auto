@@ -5,6 +5,7 @@ import path from 'path';
 const PROXY_SERVER = process.env.PROXY_SERVER || '';
 const AXENT_COOKIES = process.env.AXENT_COOKIES || '';
 const AXENT_LOCAL_STORAGE = process.env.AXENT_LOCAL_STORAGE || '';
+const CLAIM_URL = 'https://app.axenthost.com/claim';
 const CREDITS_URL = 'https://app.axenthost.com/credits';
 const MAX_ATTEMPTS = 3;
 
@@ -25,15 +26,27 @@ async function takeScreenshot(page, name) {
   }
 }
 
-// 尝试关闭可能存在的弹窗遮罩
-async function dismissAnyModals(page) {
+// 关闭 Fiverr 等模态广告弹窗，而不阻断网络请求（绕过反广告插件检测）
+async function dismissAdModals(page) {
   try {
+    // 1. 模拟按 ESC 键
+    await page.keyboard.press('Escape');
+
+    // 2. 寻找右上角的 Close 文本或按钮进行点击
+    const closeBtn = page.locator('button:has-text("Close"), text=/^Close$/i, [aria-label="Close"]').first();
+    if (await closeBtn.isVisible().catch(() => false)) {
+      await closeBtn.click({ force: true, timeout: 2000 }).catch(() => {});
+      console.log('[ad-modal] clicked close button');
+    }
+
+    // 3. 辅助移除遮罩 DOM（避开 Cloudflare）
     await page.evaluate(() => {
-      const closeButtons = document.querySelectorAll(
-        'button:has-text("Close"), .close, [aria-label="Close"], [class*="modal"] button, [id*="close"]'
-      );
-      closeButtons.forEach((btn) => btn.click());
-    });
+      document.querySelectorAll('div').forEach((el) => {
+        if (el.innerText && el.innerText.includes('Fiverr freelancers do')) {
+          el.remove();
+        }
+      });
+    }).catch(() => {});
   } catch {}
 }
 
@@ -42,36 +55,36 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
 
   // 1. 等待 "Verifying you're human in 0:0X" 倒计时结束
   for (let i = 0; i < 15; i++) {
+    await dismissAdModals(page);
     const isCountingDown = await page.evaluate(() => {
       return document.body.innerText.includes("Verifying you're human in");
     }).catch(() => false);
 
     if (!isCountingDown) break;
-    console.log('[turnstile] waiting for countdown timer to finish...');
+    console.log('[turnstile] waiting for human verification countdown...');
     await sleep(2000);
   }
 
-  // 2. 轮询处理 Turnstile 验证框
-  for (let i = 0; i < 12; i++) {
-    await dismissAnyModals(page);
+  // 2. 轮询并点击 Cloudflare Turnstile 验证框
+  for (let i = 0; i < 15; i++) {
+    await dismissAdModals(page);
 
     const frames = page.frames().filter((f) => f.url().includes('challenges.cloudflare.com'));
     if (frames.length > 0) {
       try {
-        // 匹配图 17 中的真实标签结构
-        const labelBox = frames[0].locator('.ctp-checkbox-label, label, input[type="checkbox"], body').first();
-        if (await labelBox.isVisible().catch(() => false)) {
-          await labelBox.click({ force: true, timeout: 2000 }).catch(() => {});
-          console.log('[turnstile] clicked verification label/box');
+        const checkboxLabel = frames[0].locator('.ctp-checkbox-label, label, input[type="checkbox"], #main-wrapper').first();
+        if (await checkboxLabel.isVisible().catch(() => false)) {
+          await checkboxLabel.click({ force: true, timeout: 2000 }).catch(() => {});
+          console.log('[turnstile] clicked challenge checkbox');
         }
       } catch {}
     }
 
-    // 检查验证是否通过
+    // 检查是否显示通过
     const verifiedText = page.locator('text=Verified, you are human, text="成功！"');
     const hasVerified = (await verifiedText.count()) > 0;
 
-    // 检查 "Claim 3 credits" 按钮是否已解除 disabled 状态
+    // 检查 "Claim 3 credits" 按钮是否已由灰色变为黄色激活状态
     const isReady = await page.evaluate(() => {
       const btn = Array.from(document.querySelectorAll('button')).find((b) =>
         b.textContent.includes('Claim 3 credits')
@@ -96,16 +109,13 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
 async function claimOnce(context, attemptIndex) {
   const page = await context.newPage();
 
-  // 关键优化：拦截第三方广告域名，防止全屏弹窗截断页面
-  await page.route(
-    /(doubleclick|googleadservices|googlesyndication|adnxs|rubiconproject|pubmatic|criteo|amazon-adsystem|outbrain|taboola|fiverr|adservice)/i,
-    (route) => route.abort()
-  );
-
   try {
-    await page.goto(CREDITS_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    // 直接进入 /claim 页面
+    await page.goto(CLAIM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await sleep(4000);
+    await dismissAdModals(page);
 
+    // 检查登录状态
     const currentUrl = page.url();
     const isLoginPage = currentUrl.includes('login') || (await page.locator('button:has-text("Login")').count()) > 0;
     if (isLoginPage) {
@@ -113,34 +123,41 @@ async function claimOnce(context, attemptIndex) {
       return { ok: false, reason: 'cookies-expired-or-not-logged-in' };
     }
 
-    // 点击 Hourly Free Credits 卡片上的 Claim 按钮
-    const hourlyClaimBtn = page.locator('button:has-text("Claim"), a:has-text("Claim")').first();
-    if (!(await hourlyClaimBtn.count())) {
-      await takeScreenshot(page, `attempt${attemptIndex}-credits-page-no-claim-btn`);
-      const bodyText = (await page.textContent('body').catch(() => '')) || '';
-      if (/refill in|cooldown/i.test(bodyText)) {
-        return { ok: false, reason: 'cooldown-or-already-claimed' };
+    // 若直接访问 /claim 被重定向回 /credits，则从卡片处点击跳转
+    if (page.url().includes('/credits')) {
+      const hourlyClaimBtn = page.locator('button:has-text("Claim"), a:has-text("Claim")').first();
+      if (!(await hourlyClaimBtn.count())) {
+        await takeScreenshot(page, `attempt${attemptIndex}-credits-page-no-claim-btn`);
+        const bodyText = (await page.textContent('body').catch(() => '')) || '';
+        if (/refill in\s*\d+:\d+/i.test(bodyText) || /cooldown/i.test(bodyText)) {
+          return { ok: false, reason: 'cooldown-or-already-claimed' };
+        }
+        return { ok: false, reason: 'hourly-claim-card-button-not-found' };
       }
-      return { ok: false, reason: 'hourly-claim-card-button-not-found' };
+      await hourlyClaimBtn.click();
+      await page.waitForURL(/.*\/claim/, { timeout: 15000 }).catch(() => {});
+      await sleep(3000);
     }
 
-    await hourlyClaimBtn.click();
-    await page.waitForURL(/.*\/claim/, { timeout: 15000 }).catch(() => {});
-    await sleep(3000);
+    // 检查是否在冷却时间中（如 Claims refill in 45:14）
+    const pageText = (await page.textContent('body').catch(() => '')) || '';
+    if (/Claims refill in\s*\d+:\d+/i.test(pageText)) {
+      await takeScreenshot(page, `attempt${attemptIndex}-in-cooldown`);
+      return { ok: false, reason: 'cooldown-or-already-claimed' };
+    }
 
-    // 等待倒计时及 Turnstile 验证完成
+    // 处理 Turnstile 与倒计时
     await waitAndSolveTurnstile(page, attemptIndex);
 
     // 等待并点击 "Claim 3 credits" 按钮
     const claim3Btn = page.locator('button:has-text("Claim 3 credits"), [role="button"]:has-text("Claim 3 credits")').first();
-    
-    // 确保按钮变为可用状态（Enabled）
+
     await page.waitForFunction(() => {
       const btn = Array.from(document.querySelectorAll('button')).find((b) =>
         b.textContent.includes('Claim 3 credits')
       );
       return btn && !btn.disabled && !btn.classList.contains('disabled');
-    }, { timeout: 15000 }).catch(() => {});
+    }, { timeout: 20000 }).catch(() => {});
 
     if (await claim3Btn.count()) {
       await claim3Btn.click({ force: true, timeout: 5000 });
@@ -152,12 +169,13 @@ async function claimOnce(context, attemptIndex) {
       return { ok: false, reason: 'claim-3-credits-button-not-found' };
     }
 
+    // 校验领取结果
     const resultText = (await page.textContent('body').catch(() => '')) || '';
     if (/success|claimed|\+3/i.test(resultText)) {
       const match = resultText.match(/(\d+)\s*credits?/i);
       return { ok: true, balance: match ? match[1] : 'unknown' };
     }
-    if (/already|cooldown|wait|hour|4\/5|5\/5/i.test(resultText)) {
+    if (/already|cooldown|wait|hour/i.test(resultText)) {
       return { ok: false, reason: 'cooldown-or-already-claimed' };
     }
 
