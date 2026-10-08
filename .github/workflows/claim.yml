@@ -3,17 +3,21 @@ on:
   schedule:
     - cron: '*/12 * * * *'
   workflow_dispatch:
+
 jobs:
   claim:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+
       - run: npm install
       - run: npx playwright install chromium --with-deps
+
       - name: setup sing-box proxy
         env:
           PROXY_URL: ${{ secrets.PROXY_URL }}
@@ -27,12 +31,23 @@ jobs:
           tar xzf sb.tar.gz
           node setup-proxy.mjs > sb-config.json
           ./sing-box-${SB_VER}-linux-amd64/sing-box run -c sb-config.json &
-          echo "waiting for proxy..."
-          for i in $(seq 1 20); do (echo > /dev/tcp/127.0.0.1/1080) 2>/dev/null && break; sleep 1; done
+          echo "waiting for proxy port..."
+          node -e "
+            const net = require('net');
+            const check = (retries) => {
+              const s = net.createConnection(1080, '127.0.0.1');
+              s.on('connect', () => { s.destroy(); process.exit(0); });
+              s.on('error', () => {
+                if (retries <= 0) process.exit(1);
+                setTimeout(() => check(retries - 1), 1000);
+              });
+            };
+            check(20);
+          "
           echo "PROXY_SERVER=socks5://127.0.0.1:1080" >> $GITHUB_ENV
+
       - name: claim credits
         env:
-          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
-          DISCORD_EMAIL: ${{ secrets.DISCORD_EMAIL }}
-          DISCORD_PASSWORD: ${{ secrets.DISCORD_PASSWORD }}
+          AXENT_COOKIES: ${{ secrets.AXENT_COOKIES }}
+          PROXY_SERVER: ${{ env.PROXY_SERVER }}
         run: node claim.mjs
