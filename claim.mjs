@@ -8,6 +8,7 @@ const AXENT_LOCAL_STORAGE = process.env.AXENT_LOCAL_STORAGE || '';
 const CLAIM_URL = 'https://app.axenthost.com/claim';
 const MAX_ATTEMPTS = 3;
 
+// 截图输出目录
 const SCREENSHOT_DIR = 'screenshots';
 if (!fs.existsSync(SCREENSHOT_DIR)) {
   fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
@@ -25,6 +26,7 @@ async function takeScreenshot(page, name) {
   }
 }
 
+// 轻量处理弹窗，避免触发反广告拦截阻断
 async function dismissAdModals(page) {
   try {
     await page.keyboard.press('Escape');
@@ -38,25 +40,34 @@ async function dismissAdModals(page) {
 async function waitAndSolveTurnstile(page, attemptIndex) {
   console.log('[turnstile] waiting for verification...');
 
-  // 1. 等待倒计时结束
-  for (let i = 0; i < 10; i++) {
+  // 1. 等待倒计时 (如 Verifying you're human in 0:0X)
+  for (let i = 0; i < 8; i++) {
     const isCountingDown = await page.evaluate(() => {
       return document.body.innerText.includes("Verifying you're human in");
     }).catch(() => false);
+
     if (!isCountingDown) break;
+    console.log('[turnstile] waiting for countdown timer to finish...');
     await sleep(2000);
   }
 
-  // 2. 轮询并执行点击
+  // 2. 轮询并精确命中 24x24 空白复选框正中心
   for (let i = 0; i < 15; i++) {
     await dismissAdModals(page);
 
-    // 检查是否已通过（存在验证 Token 或已激活按钮）
+    // 检查隐藏表单是否已生成 Token
     const hasToken = await page.evaluate(() => {
       const input = document.querySelector('input[name*="turnstile-response"]');
       return !!(input && input.value && input.value.length > 20);
     }).catch(() => false);
 
+    // 检查前端提示
+    const isVerifiedText = await page.evaluate(() => {
+      const text = document.body.innerText;
+      return text.includes('Verified, you are human') || text.includes('成功！');
+    }).catch(() => false);
+
+    // 检查按钮是否已就绪（排除 Securing 状态）
     const isBtnReady = await page.evaluate(() => {
       const btn = Array.from(document.querySelectorAll('button')).find((b) =>
         b.textContent.includes('Claim 3 credits')
@@ -65,36 +76,38 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
       return btn && !btn.disabled && !isSecuring;
     }).catch(() => false);
 
-    if (hasToken || isBtnReady) {
+    if (hasToken || isVerifiedText || isBtnReady) {
       console.log('[turnstile] verification passed successfully!');
       await takeScreenshot(page, `attempt${attemptIndex}-turnstile-passed`);
       return true;
     }
 
-    // 寻找包含 Turnstile 的 Frame
-    const cfFrame = page.frames().find((f) => f.url().includes('challenges.cloudflare.com'));
-    if (cfFrame) {
-      const frameElement = await cfFrame.frameElement().catch(() => null);
-      if (frameElement) {
-        const box = await frameElement.boundingBox().catch(() => null);
-        if (box && box.width >= 200 && box.width <= 380) {
-          const clickX = Math.round(box.x + 35);
-          const clickY = Math.round(box.y + box.height / 2);
-          console.log(`[turnstile] attempt ${i + 1}: clicking at (${clickX}, ${clickY})`);
+    // 严格定位 Cloudflare 验证 iframe，排除广告干扰
+    const cfIframe = page.locator('iframe[src*="challenges.cloudflare.com"]').first();
+    const isVisible = await cfIframe.isVisible().catch(() => false);
 
-          // 1. 尝试直接点击 frame 内部的 body 偏左区域
-          await cfFrame.locator('body').click({
-            position: { x: 35, y: Math.round(box.height / 2) },
-            timeout: 2000,
-            force: true,
-          }).catch(() => {});
+    if (isVisible) {
+      // 聚焦 iframe
+      await cfIframe.focus().catch(() => {});
+      await sleep(100);
 
-          // 2. 模拟外层物理鼠标点击作为兜底
-          await page.mouse.click(clickX, clickY, { delay: 60 });
-        }
+      // 对准 24x24 复选框中心 (X=24 是理论中心，20 与 28 为微调容错)
+      const targetOffsets = [24, 20, 28];
+      const offsetX = targetOffsets[i % targetOffsets.length];
+
+      try {
+        await cfIframe.click({
+          position: { x: offsetX, y: 32 },
+          delay: 80,
+          timeout: 3000,
+          force: true,
+        });
+        console.log(`[turnstile] attempt ${i + 1}: clicked checkbox at offset (${offsetX}, 32)`);
+      } catch (err) {
+        console.warn(`[turnstile] frame click error: ${err.message}`);
       }
     } else {
-      console.log(`[turnstile] attempt ${i + 1}: cf frame not found yet`);
+      console.log(`[turnstile] attempt ${i + 1}: cf iframe not visible yet`);
     }
 
     await sleep(2500);
@@ -120,7 +133,7 @@ async function claimOnce(context, attemptIndex) {
       return { ok: false, reason: 'cookies-expired-or-not-logged-in' };
     }
 
-    // 检查右侧统计卡片是否处于冷却中（明确带有倒计时，如 Claims refill in 45:14）
+    // 检查右侧统计卡片是否处于冷却中（需包含明确的时间数字，如 45:14）
     const isCooling = await page.evaluate(() => {
       const refillMatch = document.body.innerText.match(/Claims refill in\s*(\d+:\d+)/i);
       return refillMatch ? refillMatch[1] : null;
@@ -150,7 +163,7 @@ async function claimOnce(context, attemptIndex) {
       return { ok: false, reason: 'button-disabled-verification-failed' };
     }
 
-    // 按钮已解除禁用，正常点击
+    // 正常激活后点击
     const claim3Btn = page.locator('button:has-text("Claim 3 credits")').first();
     await claim3Btn.click({ timeout: 5000 });
     console.log('[claim] successfully clicked Claim 3 credits button');
