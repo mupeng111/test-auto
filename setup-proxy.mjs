@@ -1,120 +1,199 @@
-// Parses PROXY_URL (vless://, vmess://, trojan://, hysteria2://, hy2://, tuic://)
-// and generates a sing-box config with a local mixed inbound (socks5+http on 127.0.0.1:1080).
-// Usage: PROXY_URL="vless://..." node setup-proxy.mjs > sb-config.json
+import fs from 'fs';
 
-function parseVmess(link) {
-  const b64 = link.replace('vmess://', '');
-  // pad base64 if needed (handle base64url too)
-  const norm = b64.replace(/-/g, '+').replace(/_/g, '/');
-  const padded = norm + '='.repeat((4 - (norm.length % 4)) % 4);
-  const decoded = Buffer.from(padded, 'base64').toString('utf8');
-  let j;
-  try {
-    j = JSON.parse(decoded);
-  } catch {
-    // fallback: "security:uuid@host:port" or "uuid@host:port" plain format
-    // aggressively strip invisible chars (zero-width spaces, BOM, control chars, fancy hyphens)
-    let clean = decoded
-      .replace(/[\u0000-\u001F\u007F-\u009F\u200B-\u200D\uFEFF]/g, '')
-      .replace(/[\u2010-\u2015\u2212]/g, '-')
-      .trim();
-    // match at start only; ignore any trailing garbage after the port
-    const m = clean.match(/^(?:(\w+):)?([^@\s]+)@([^:\s]+):(\d+)/);
-    if (!m) throw new Error('unrecognized vmess payload: ' + clean.slice(0, 60));
-    const [, sec, uuid, host, port] = m;
-    j = { add: host, port, id: uuid, aid: '0', scy: sec && sec !== 'none' ? sec : 'auto', net: 'tcp', tls: parseInt(port) === 443 ? 'tls' : '' };
-  }
-  const ob = { type: 'vmess', server: j.add, server_port: parseInt(j.port), uuid: j.id, security: j.scy || 'auto', alter_id: parseInt(j.aid || '0') };
-  applyTransport(ob, j);
-  return ob;
+const rawUrl = (process.env.PROXY_URL || '').trim();
+
+if (!rawUrl) {
+  console.error('[proxy-setup] PROXY_URL is empty');
+  process.exit(1);
 }
 
-function applyTransport(ob, j) {
-  const net = j.net || 'tcp';
-  if (net === 'ws') {
-    ob.transport = { type: 'ws', path: j.path || '/', headers: j.host ? { Host: j.host } : {} };
-    if (j.tls === 'tls') { ob.tls = { enabled: true, server_name: j.sni || j.host || j.add, insecure: false }; }
-  } else if (net === 'grpc') {
-    ob.transport = { type: 'grpc', service_name: j.path || '' };
-    if (j.tls === 'tls') { ob.tls = { enabled: true, server_name: j.sni || j.add }; }
-  } else if (net === 'tcp') {
-    if (j.type === 'http') {
-      ob.transport = { type: 'http', host: j.host ? [j.host] : [], path: j.path || '/' };
-    }
-    if (j.tls === 'tls') { ob.tls = { enabled: true, server_name: j.sni || j.add }; }
-  }
-  if (j.fp) { ob.tls = ob.tls || { enabled: true, server_name: j.sni || j.add }; ob.tls.utls = { enabled: true, fingerprint: j.fp }; }
-}
+function parseProxy(link) {
+  const protocol = link.split('://')[0].toLowerCase();
 
-function parseXrayLink(link) {
-  // vless://, trojan://, hysteria2://, hy2://, tuic://
-  const u = new URL(link);
-  const proto = u.protocol.replace(':', '');
-  const params = Object.fromEntries(u.searchParams.entries());
-  const server = u.hostname;
-  const port = parseInt(u.port);
-  const security = params.security || '';
+  // 1. VLESS (支持 Reality, TLS, WebSocket, gRPC)
+  if (protocol === 'vless') {
+    const url = new URL(link);
+    const params = Object.fromEntries(url.searchParams);
+    const outbound = {
+      type: 'vless',
+      tag: 'proxy',
+      server: url.hostname,
+      server_port: parseInt(url.port, 10),
+      uuid: url.username,
+      flow: params.flow || undefined,
+    };
 
-  if (proto === 'vless') {
-    const ob = { type: 'vless', server, server_port: port, uuid: decodeURIComponent(u.username), flow: params.flow || undefined };
-    const net = params.type || 'tcp';
-    if (net === 'ws') {
-      ob.transport = { type: 'ws', path: params.path || '/', headers: params.host ? { Host: params.host } : {} };
-    } else if (net === 'grpc') {
-      ob.transport = { type: 'grpc', service_name: params.serviceName || '' };
-    }
-    if (security === 'tls') {
-      ob.tls = { enabled: true, server_name: params.sni || server };
-      if (params.fp) ob.tls.utls = { enabled: true, fingerprint: params.fp };
-      if (params.alpn) ob.tls.alpn = params.alpn.split(',');
-    } else if (security === 'reality') {
-      ob.tls = {
-        enabled: true, server_name: params.sni || server,
-        reality: { enabled: true, public_key: params.pbk || '', short_id: params.sid || '' },
+    if (params.security === 'reality') {
+      outbound.tls = {
+        enabled: true,
+        server_name: params.sni || url.hostname,
+        reality: {
+          enabled: true,
+          public_key: params.pbk || '',
+          short_id: params.sid || '',
+        },
       };
-      if (params.fp) ob.tls.utls = { enabled: true, fingerprint: params.fp };
+      if (params.fp) outbound.tls.utls = { enabled: true, fingerprint: params.fp };
+    } else if (params.security === 'tls') {
+      outbound.tls = {
+        enabled: true,
+        server_name: params.sni || url.hostname,
+        insecure: params.allowInsecure === '1',
+      };
+      if (params.fp) outbound.tls.utls = { enabled: true, fingerprint: params.fp };
     }
-    return ob;
+
+    if (params.type === 'ws') {
+      outbound.transport = {
+        type: 'ws',
+        path: params.path || '/',
+        headers: params.host ? { Host: params.host } : undefined,
+      };
+    } else if (params.type === 'grpc') {
+      outbound.transport = {
+        type: 'grpc',
+        service_name: params.serviceName || '',
+      };
+    }
+    return outbound;
   }
-  if (proto === 'trojan') {
-    const ob = { type: 'trojan', server, server_port: port, password: decodeURIComponent(u.username) };
-    const net = params.type || 'tcp';
-    if (net === 'ws') ob.transport = { type: 'ws', path: params.path || '/', headers: params.host ? { Host: params.host } : {} };
-    ob.tls = { enabled: true, server_name: params.sni || server };
-    if (params.fp) ob.tls.utls = { enabled: true, fingerprint: params.fp };
-    return ob;
+
+  // 2. VMESS (Base64 JSON)
+  if (protocol === 'vmess') {
+    const b64 = link.replace('vmess://', '');
+    const jsonStr = Buffer.from(b64, 'base64').toString('utf-8');
+    const v = JSON.parse(jsonStr);
+
+    const outbound = {
+      type: 'vmess',
+      tag: 'proxy',
+      server: v.add,
+      server_port: parseInt(v.port, 10),
+      uuid: v.id,
+      security: v.scy || 'auto',
+      alter_id: parseInt(v.aid || 0, 10),
+    };
+
+    if (v.tls === 'tls') {
+      outbound.tls = {
+        enabled: true,
+        server_name: v.sni || v.host || v.add,
+      };
+    }
+
+    if (v.net === 'ws') {
+      outbound.transport = {
+        type: 'ws',
+        path: v.path || '/',
+        headers: v.host ? { Host: v.host } : undefined,
+      };
+    }
+    return outbound;
   }
-  if (proto === 'hysteria2' || proto === 'hy2') {
-    const ob = { type: 'hysteria2', server, server_port: port, password: decodeURIComponent(u.username) || params.auth || '' };
-    ob.tls = { enabled: true, server_name: params.sni || server };
-    if (params.insecure === '1') ob.tls.insecure = true;
-    if (params.obfs) ob.obfs = { type: params.obfs, password: params['obfs-password'] || '' };
-    return ob;
+
+  // 3. HYSTERIA 2
+  if (protocol === 'hysteria2' || protocol === 'hy2') {
+    const normalized = link.replace(/^hy2:\/\//, 'hysteria2://');
+    const url = new URL(normalized);
+    const params = Object.fromEntries(url.searchParams);
+    const outbound = {
+      type: 'hysteria2',
+      tag: 'proxy',
+      server: url.hostname,
+      server_port: parseInt(url.port, 10),
+      password: url.username || url.password,
+      tls: {
+        enabled: true,
+        server_name: params.sni || url.hostname,
+        insecure: params.insecure === '1',
+      },
+    };
+    if (params.obfs && params.obfs !== 'none') {
+      outbound.obfs = {
+        type: params.obfs,
+        password: params['obfs-password'] || '',
+      };
+    }
+    return outbound;
   }
-  if (proto === 'tuic') {
-    const [uuid, password] = decodeURIComponent(u.username).split(':');
-    const ob = { type: 'tuic', server, server_port: port, uuid, password: password || uuid };
-    ob.tls = { enabled: true, server_name: params.sni || server };
-    if (params.alpn) ob.tls.alpn = params.alpn.split(',');
-    ob.congestion_control = params.congestion_control || 'bbr';
-    return ob;
+
+  // 4. TROJAN
+  if (protocol === 'trojan') {
+    const url = new URL(link);
+    const params = Object.fromEntries(url.searchParams);
+    const outbound = {
+      type: 'trojan',
+      tag: 'proxy',
+      server: url.hostname,
+      server_port: parseInt(url.port, 10),
+      password: url.username,
+      tls: {
+        enabled: true,
+        server_name: params.sni || url.hostname,
+        insecure: params.allowInsecure === '1',
+      },
+    };
+    if (params.type === 'ws') {
+      outbound.transport = {
+        type: 'ws',
+        path: params.path || '/',
+        headers: params.host ? { Host: params.host } : undefined,
+      };
+    }
+    return outbound;
   }
-  throw new Error('unsupported protocol: ' + proto);
+
+  // 5. SHADOWSOCKS
+  if (protocol === 'ss') {
+    const clean = link.replace('ss://', '').split('#')[0];
+    let method, password, server, port;
+    if (clean.includes('@')) {
+      const [userinfo, serverinfo] = clean.split('@');
+      const decoded = Buffer.from(userinfo, 'base64').toString('utf-8');
+      [method, password] = decoded.split(':');
+      [server, port] = serverinfo.split(':');
+    } else {
+      const decoded = Buffer.from(clean, 'base64').toString('utf-8');
+      const [userinfo, serverinfo] = decoded.split('@');
+      [method, password] = userinfo.split(':');
+      [server, port] = serverinfo.split(':');
+    }
+    return {
+      type: 'shadowsocks',
+      tag: 'proxy',
+      server,
+      server_port: parseInt(port, 10),
+      method,
+      password,
+    };
+  }
+
+  throw new Error(`Unsupported protocol: ${protocol}`);
 }
 
-const raw = (process.env.PROXY_URL || '').trim();
-if (!raw) { console.error('PROXY_URL not set'); process.exit(1); }
+try {
+  const outboundConfig = parseProxy(rawUrl);
+  const singBoxConfig = {
+    log: { level: 'warn' },
+    inbounds: [
+      {
+        type: 'mixed',
+        tag: 'mixed-in',
+        listen: '127.0.0.1',
+        listen_port: 1080,
+      },
+    ],
+    outbounds: [
+      outboundConfig,
+      {
+        type: 'direct',
+        tag: 'direct',
+      },
+    ],
+  };
 
-let outbound;
-if (raw.startsWith('vmess://')) outbound = parseVmess(raw);
-else outbound = parseXrayLink(raw);
-// strip undefined
-outbound = JSON.parse(JSON.stringify(outbound));
-outbound.tag = 'proxy';
-
-const config = {
-  log: { level: 'warn' },
-  inbounds: [{ type: 'mixed', tag: 'mixed-in', listen: '127.0.0.1', listen_port: 1080 }],
-  outbounds: [outbound, { type: 'direct', tag: 'direct' }],
-};
-console.log(JSON.stringify(config, null, 2));
+  console.log(JSON.stringify(singBoxConfig, null, 2));
+} catch (e) {
+  console.error('[proxy-setup] Failed to parse URL:', e.message);
+  process.exit(1);
+}
