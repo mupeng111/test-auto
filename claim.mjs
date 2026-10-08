@@ -26,7 +26,7 @@ async function takeScreenshot(page, name) {
   }
 }
 
-// 轻量处理弹窗，避免触发反广告拦截阻断
+// 模拟 ESC，安全关闭可能遮挡的模态弹窗
 async function dismissAdModals(page) {
   try {
     await page.keyboard.press('Escape');
@@ -37,10 +37,40 @@ async function dismissAdModals(page) {
   } catch {}
 }
 
+// 稳定获取可见的 Turnstile 真实组件
+async function getTurnstileWidget(page) {
+  // 方式 1：通过 frame 列表匹配
+  for (const frame of page.frames()) {
+    if (frame.url().includes('challenges.cloudflare.com')) {
+      const frameEl = await frame.frameElement().catch(() => null);
+      if (frameEl) {
+        const box = await frameEl.boundingBox().catch(() => null);
+        if (box && box.width >= 200 && box.width <= 380 && box.height >= 40 && box.height <= 90) {
+          return { frameEl, box };
+        }
+      }
+    }
+  }
+
+  // 方式 2：遍历页面 iframe 元素
+  const iframes = await page.locator('iframe').all();
+  for (const iframe of iframes) {
+    const src = (await iframe.getAttribute('src').catch(() => '')) || '';
+    if (src.includes('challenges.cloudflare.com') || src.includes('turnstile')) {
+      const box = await iframe.boundingBox().catch(() => null);
+      if (box && box.width >= 200 && box.width <= 380 && box.height >= 40 && box.height <= 90) {
+        return { frameEl: iframe, box };
+      }
+    }
+  }
+
+  return null;
+}
+
 async function waitAndSolveTurnstile(page, attemptIndex) {
   console.log('[turnstile] waiting for verification...');
 
-  // 1. 等待倒计时 (如 Verifying you're human in 0:0X)
+  // 1. 等待可能的前置倒计时 (如 Verifying you're human in 0:0X)
   for (let i = 0; i < 8; i++) {
     const isCountingDown = await page.evaluate(() => {
       return document.body.innerText.includes("Verifying you're human in");
@@ -55,19 +85,19 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
   for (let i = 0; i < 15; i++) {
     await dismissAdModals(page);
 
-    // 检查隐藏表单是否已生成 Token
+    // 检查隐藏输入框是否已生成 cf-turnstile-response Token
     const hasToken = await page.evaluate(() => {
-      const input = document.querySelector('input[name*="turnstile-response"]');
+      const input = document.querySelector('input[name="cf-turnstile-response"], input[name*="turnstile-response"]');
       return !!(input && input.value && input.value.length > 20);
     }).catch(() => false);
 
-    // 检查前端提示
+    // 检查页面提示
     const isVerifiedText = await page.evaluate(() => {
       const text = document.body.innerText;
       return text.includes('Verified, you are human') || text.includes('成功！');
     }).catch(() => false);
 
-    // 检查按钮是否已就绪（排除 Securing 状态）
+    // 检查领取按钮是否已激活（非 disabled 且无 Securing）
     const isBtnReady = await page.evaluate(() => {
       const btn = Array.from(document.querySelectorAll('button')).find((b) =>
         b.textContent.includes('Claim 3 credits')
@@ -82,32 +112,48 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
       return true;
     }
 
-    // 严格定位 Cloudflare 验证 iframe，排除广告干扰
-    const cfIframe = page.locator('iframe[src*="challenges.cloudflare.com"]').first();
-    const isVisible = await cfIframe.isVisible().catch(() => false);
+    // 获取可见的 Turnstile iframe
+    const widget = await getTurnstileWidget(page);
 
-    if (isVisible) {
+    if (widget) {
+      const { frameEl, box } = widget;
+
+      // 24x24 方框在 iframe 内部的中心点微调（24 为几何中心，20 与 28 为容错点）
+      const relativeOffsets = [24, 20, 28];
+      const relX = relativeOffsets[i % relativeOffsets.length];
+      const relY = Math.round(box.height / 2); // 垂直正中心约为 32px
+
+      const absX = Math.round(box.x + relX);
+      const absY = Math.round(box.y + relY);
+
+      console.log(`[turnstile] attempt ${i + 1}: clicking 24x24 checkbox center at (${absX}, ${absY}) [relative: (${relX}, ${relY})]`);
+
       // 聚焦 iframe
-      await cfIframe.focus().catch(() => {});
+      await frameEl.focus().catch(() => {});
       await sleep(100);
 
-      // 对准 24x24 复选框中心 (X=24 是理论中心，20 与 28 为微调容错)
-      const targetOffsets = [24, 20, 28];
-      const offsetX = targetOffsets[i % targetOffsets.length];
-
+      // 方法 1：通过 ElementHandle 派发相对位置点击
       try {
-        await cfIframe.click({
-          position: { x: offsetX, y: 32 },
+        await frameEl.click({
+          position: { x: relX, y: relY },
           delay: 80,
-          timeout: 3000,
+          timeout: 2500,
           force: true,
         });
-        console.log(`[turnstile] attempt ${i + 1}: clicked checkbox at offset (${offsetX}, 32)`);
-      } catch (err) {
-        console.warn(`[turnstile] frame click error: ${err.message}`);
-      }
+      } catch {}
+
+      // 方法 2：模拟自然鼠标轨迹移动与点击作为物理兜底
+      try {
+        await page.mouse.move(absX - 25, absY, { steps: 5 });
+        await sleep(50);
+        await page.mouse.move(absX, absY, { steps: 5 });
+        await sleep(100);
+        await page.mouse.down();
+        await sleep(80);
+        await page.mouse.up();
+      } catch {}
     } else {
-      console.log(`[turnstile] attempt ${i + 1}: cf iframe not visible yet`);
+      console.log(`[turnstile] attempt ${i + 1}: widget frame not found or not ready yet`);
     }
 
     await sleep(2500);
@@ -126,14 +172,14 @@ async function claimOnce(context, attemptIndex) {
     await sleep(4000);
     await dismissAdModals(page);
 
-    // 检查登录状态
+    // 检查登录态
     const isLoginPage = page.url().includes('login') || (await page.locator('button:has-text("Login")').count()) > 0;
     if (isLoginPage) {
       await takeScreenshot(page, `attempt${attemptIndex}-login-failed`);
       return { ok: false, reason: 'cookies-expired-or-not-logged-in' };
     }
 
-    // 检查右侧统计卡片是否处于冷却中（需包含明确的时间数字，如 45:14）
+    // 检查是否处于冷却中（需包含明确的时间，如 Claims refill in 45:14）
     const isCooling = await page.evaluate(() => {
       const refillMatch = document.body.innerText.match(/Claims refill in\s*(\d+:\d+)/i);
       return refillMatch ? refillMatch[1] : null;
@@ -148,7 +194,7 @@ async function claimOnce(context, attemptIndex) {
     // 处理 Turnstile 验证
     await waitAndSolveTurnstile(page, attemptIndex);
 
-    // 等待按钮解锁
+    // 等待按钮解除禁用
     const isEnabled = await page.waitForFunction(() => {
       const btn = Array.from(document.querySelectorAll('button')).find((b) =>
         b.textContent.includes('Claim 3 credits')
