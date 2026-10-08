@@ -8,7 +8,6 @@ const AXENT_LOCAL_STORAGE = process.env.AXENT_LOCAL_STORAGE || '';
 const CREDITS_URL = 'https://app.axenthost.com/credits';
 const MAX_ATTEMPTS = 3;
 
-// 创建截图输出目录
 const SCREENSHOT_DIR = 'screenshots';
 if (!fs.existsSync(SCREENSHOT_DIR)) {
   fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
@@ -26,24 +25,53 @@ async function takeScreenshot(page, name) {
   }
 }
 
-async function waitAndSolveTurnstile(page, attemptIndex) {
-  console.log('[turnstile] waiting for verification to complete...');
+// 尝试关闭可能存在的弹窗遮罩
+async function dismissAnyModals(page) {
+  try {
+    await page.evaluate(() => {
+      const closeButtons = document.querySelectorAll(
+        'button:has-text("Close"), .close, [aria-label="Close"], [class*="modal"] button, [id*="close"]'
+      );
+      closeButtons.forEach((btn) => btn.click());
+    });
+  } catch {}
+}
 
-  for (let i = 0; i < 10; i++) {
+async function waitAndSolveTurnstile(page, attemptIndex) {
+  console.log('[turnstile] waiting for verification...');
+
+  // 1. 等待 "Verifying you're human in 0:0X" 倒计时结束
+  for (let i = 0; i < 15; i++) {
+    const isCountingDown = await page.evaluate(() => {
+      return document.body.innerText.includes("Verifying you're human in");
+    }).catch(() => false);
+
+    if (!isCountingDown) break;
+    console.log('[turnstile] waiting for countdown timer to finish...');
+    await sleep(2000);
+  }
+
+  // 2. 轮询处理 Turnstile 验证框
+  for (let i = 0; i < 12; i++) {
+    await dismissAnyModals(page);
+
     const frames = page.frames().filter((f) => f.url().includes('challenges.cloudflare.com'));
     if (frames.length > 0) {
       try {
-        const checkbox = frames[0].locator('input[type="checkbox"], .cb-lb, [role="checkbox"]').first();
-        if (await checkbox.isVisible().catch(() => false)) {
-          await checkbox.click({ timeout: 2000 }).catch(() => {});
-          console.log('[turnstile] clicked challenge checkbox');
+        // 匹配图 17 中的真实标签结构
+        const labelBox = frames[0].locator('.ctp-checkbox-label, label, input[type="checkbox"], body').first();
+        if (await labelBox.isVisible().catch(() => false)) {
+          await labelBox.click({ force: true, timeout: 2000 }).catch(() => {});
+          console.log('[turnstile] clicked verification label/box');
         }
       } catch {}
     }
 
+    // 检查验证是否通过
     const verifiedText = page.locator('text=Verified, you are human, text="成功！"');
     const hasVerified = (await verifiedText.count()) > 0;
 
+    // 检查 "Claim 3 credits" 按钮是否已解除 disabled 状态
     const isReady = await page.evaluate(() => {
       const btn = Array.from(document.querySelectorAll('button')).find((b) =>
         b.textContent.includes('Claim 3 credits')
@@ -67,18 +95,25 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
 
 async function claimOnce(context, attemptIndex) {
   const page = await context.newPage();
+
+  // 关键优化：拦截第三方广告域名，防止全屏弹窗截断页面
+  await page.route(
+    /(doubleclick|googleadservices|googlesyndication|adnxs|rubiconproject|pubmatic|criteo|amazon-adsystem|outbrain|taboola|fiverr|adservice)/i,
+    (route) => route.abort()
+  );
+
   try {
     await page.goto(CREDITS_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await sleep(4000);
 
     const currentUrl = page.url();
     const isLoginPage = currentUrl.includes('login') || (await page.locator('button:has-text("Login")').count()) > 0;
-    
     if (isLoginPage) {
       await takeScreenshot(page, `attempt${attemptIndex}-login-failed`);
       return { ok: false, reason: 'cookies-expired-or-not-logged-in' };
     }
 
+    // 点击 Hourly Free Credits 卡片上的 Claim 按钮
     const hourlyClaimBtn = page.locator('button:has-text("Claim"), a:has-text("Claim")').first();
     if (!(await hourlyClaimBtn.count())) {
       await takeScreenshot(page, `attempt${attemptIndex}-credits-page-no-claim-btn`);
@@ -93,13 +128,22 @@ async function claimOnce(context, attemptIndex) {
     await page.waitForURL(/.*\/claim/, { timeout: 15000 }).catch(() => {});
     await sleep(3000);
 
-    // 等待并识别 Turnstile 验证
+    // 等待倒计时及 Turnstile 验证完成
     await waitAndSolveTurnstile(page, attemptIndex);
 
-    // 寻找最终确认按钮
-    const claim3Btn = page.locator('button:has-text("Claim 3 credits")').first();
+    // 等待并点击 "Claim 3 credits" 按钮
+    const claim3Btn = page.locator('button:has-text("Claim 3 credits"), [role="button"]:has-text("Claim 3 credits")').first();
+    
+    // 确保按钮变为可用状态（Enabled）
+    await page.waitForFunction(() => {
+      const btn = Array.from(document.querySelectorAll('button')).find((b) =>
+        b.textContent.includes('Claim 3 credits')
+      );
+      return btn && !btn.disabled && !btn.classList.contains('disabled');
+    }, { timeout: 15000 }).catch(() => {});
+
     if (await claim3Btn.count()) {
-      await claim3Btn.click({ timeout: 5000 });
+      await claim3Btn.click({ force: true, timeout: 5000 });
       console.log('[claim] clicked Claim 3 credits button');
       await sleep(5000);
       await takeScreenshot(page, `attempt${attemptIndex}-after-click-claim3`);
@@ -149,7 +193,7 @@ async function claimOnce(context, attemptIndex) {
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   });
 
-  // 注入 LocalStorage
+  // 1. 注入 LocalStorage
   if (AXENT_LOCAL_STORAGE) {
     try {
       const storage = JSON.parse(AXENT_LOCAL_STORAGE);
@@ -164,7 +208,7 @@ async function claimOnce(context, attemptIndex) {
     }
   }
 
-  // 注入 Cookies
+  // 2. 注入 Cookies
   if (AXENT_COOKIES) {
     try {
       const parsed = JSON.parse(AXENT_COOKIES);
