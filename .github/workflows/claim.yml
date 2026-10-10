@@ -1,7 +1,7 @@
 name: axent-hourly-claim
 on:
   schedule:
-    - cron: '0 * * * *' # 每小时定时执行一次
+    - cron: '4 * * * *' # 每小时定时执行一次
   workflow_dispatch:      # 允许手动在网页端触发
 
 concurrency:
