@@ -1,7 +1,7 @@
 name: axent-hourly-claim
 on:
   schedule:
-    - cron: '4 * * * *' # 每小时定时执行一次
+    - cron: '17 * * * *' # 每小时定时执行一次
   workflow_dispatch:      # 允许手动在网页端触发
 
 concurrency:
@@ -17,7 +17,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: 检出仓库代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v417
 
       - name: 安装 Node.js 运行环境
         uses: actions/setup-node@v4
