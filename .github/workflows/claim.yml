@@ -69,7 +69,11 @@ jobs:
           AXENT_COOKIES: ${{ secrets.AXENT_COOKIES }}
           AXENT_LOCAL_STORAGE: ${{ secrets.AXENT_LOCAL_STORAGE }}
           PROXY_SERVER: ${{ env.PROXY_SERVER }}
-        run: node claim.mjs
+        run: |
+          if ! command -v xvfb-run >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y xvfb
+          fi
+          xvfb-run -a node claim.mjs
 
       - name: Refresh login secrets
         if: always()
