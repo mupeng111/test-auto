@@ -299,15 +299,45 @@ async function claimOnce(context, attemptIndex) {
     }
   }
 
+  const cooldownToSeconds = (value) => {
+    if (!value) return null;
+    const parts = String(value).split(':').map(Number);
+    if (parts.some(Number.isNaN)) return null;
+    return parts.reduce((total, n) => total * 60 + n, 0);
+  };
+
   let result = { ok: false, reason: 'not-run' };
-  for (let i = 0; i < MAX_ATTEMPTS; i++) {
-    console.log(`[run] attempt ${i + 1}/${MAX_ATTEMPTS}`);
-    result = await claimOnce(context, i + 1);
+  let claimedCount = 0;
+  let failures = 0;
+  let waitedShortCooldown = false;
+  for (let attemptNo = 1; ; attemptNo++) {
+    console.log(`[run] attempt ${attemptNo}`);
+    result = await claimOnce(context, attemptNo);
     console.log('[run] result:', JSON.stringify(result));
 
-    if (result.ok || result.reason === 'cooldown-or-already-claimed') break;
+    if (result.reason === 'cooldown-or-already-claimed') {
+      const cooldownSec = cooldownToSeconds(result.cooldown);
+      if (claimedCount === 0 && !waitedShortCooldown && cooldownSec !== null && cooldownSec <= 12 * 60) {
+        waitedShortCooldown = true;
+        console.log(`[claim] short cooldown ${result.cooldown}, waiting ${cooldownSec + 15}s`);
+        await sleep((cooldownSec + 15) * 1000);
+        continue;
+      }
+      break;
+    }
+
+    if (result.ok) {
+      claimedCount++;
+      console.log(`[claim] claimed this run: ${claimedCount}`);
+      if (claimedCount >= 5) break;
+      continue;
+    }
+
+    failures++;
+    if (failures >= MAX_ATTEMPTS) break;
     await sleep(8000);
   }
+  console.log(`[claim] total claimed this run: ${claimedCount}`);
 
   if (result.ok || result.reason === 'cooldown-or-already-claimed') {
     try {
