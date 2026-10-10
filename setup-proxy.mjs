@@ -168,6 +168,25 @@ function parseProxy(link) {
     };
   }
 
+  // 6. ANYTLS
+  if (protocol === 'anytls') {
+    const url = new URL(link);
+    const params = Object.fromEntries(url.searchParams);
+    const outbound = {
+      type: 'anytls',
+      tag: 'proxy',
+      server: url.hostname,
+      server_port: parseInt(url.port, 10),
+      password: url.username,
+      tls: {
+        enabled: true,
+        server_name: params.sni || url.hostname,
+        insecure: params.insecure === '1' || params.allowInsecure === '1',
+      },
+    };
+    return outbound;
+  }
+
   throw new Error(`Unsupported protocol: ${protocol}`);
 }
 
