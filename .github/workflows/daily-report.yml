@@ -2,8 +2,8 @@ name: tg-daily-report
 
 on:
   schedule:
-    - cron: '0 1 * * *'
-  workflow_dispatch:
+    - cron: '0 1 * * *' # 每天北京时间约 09:00 执行每日汇总
+  workflow_dispatch:      # 允许手动触发汇报
 
 permissions:
   actions: read
@@ -12,7 +12,7 @@ jobs:
   daily-report:
     runs-on: ubuntu-latest
     steps:
-      - name: Build daily report
+      - name: 生成并推送每日汇报至 Telegram
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -22,6 +22,7 @@ jobs:
           set +e
           REPO="${{ github.repository }}"
           TODAY=$(TZ=Asia/Shanghai date +%F)
+          # 获取最近一条完成状态的领取任务记录
           RUN_JSON=$(gh api "repos/$REPO/actions/workflows/claim.yml/runs?per_page=20&status=completed" 2>/dev/null || echo '{}')
           RUN_ID=$(echo "$RUN_JSON" | jq -r '.workflow_runs[0].id // empty')
           RUN_NUM=$(echo "$RUN_JSON" | jq -r '.workflow_runs[0].run_number // empty')
@@ -32,6 +33,7 @@ jobs:
           FINAL="未读到"
           ENTRY="未读到"
           REASON=""
+          # 下载该次运行日志并解压提取关键结果
           if [ -n "$RUN_ID" ]; then
             gh api "repos/$REPO/actions/runs/$RUN_ID/logs" > run-logs.zip 2>/dev/null || true
             mkdir -p run-logs
@@ -45,15 +47,19 @@ jobs:
             [ -n "$F" ] && FINAL="$F"
             REASON=$(echo "$LOGTXT" | grep -oE '"reason":"[^"]+"' | tail -1)
           fi
-          MSG="📊 Axent 每日汇报 ($TODAY)
-          最新运行: #${RUN_NUM:-?} 触发: ${RUN_EVENT:-?} 结论: ${RUN_CONC:-?}
-          创建时间(UTC): ${RUN_AT:-?}
-          进入时剩余: ${ENTRY}
-          最近领取: ${TOTAL}
-          最终结果: ${FINAL}"
+          # 组装 Telegram 汇报消息文本
+          MSG="📊【Axent 每日运行汇报】($TODAY)
+           ━━━━━━━━━━━━━━━━━━━━
+           🔢 最新批次：#${RUN_NUM:-?}
+           ⚡ 触发途径：${RUN_EVENT:-?}
+          📌 运行结论：${RUN_CONC:-?}
+          🕒 创建时间(UTC)：${RUN_AT:-?}
+          🎫 启动时剩余：${ENTRY}
+          🎁 本次领取总量：${TOTAL}
+          📋 最终返回结果：${FINAL}"
           if [ "$RUN_CONC" = "failure" ]; then
             MSG="${MSG}
-          ⚠️ 最新运行失败，类别参考: ${REASON:-未读到}"
+          ⚠️ 运行异常分类参考：${REASON:-未读到}"
           fi
           echo "----- daily report -----"
           echo "$MSG"
