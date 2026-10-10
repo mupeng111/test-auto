@@ -33,7 +33,7 @@ jobs:
             echo "PROXY_URL secret not set, skipping proxy setup"
             exit 0
           fi
-          SB_VER=1.11.4
+          SB_VER=1.12.0
           curl -sL -o sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-amd64.tar.gz"
           tar xzf sb.tar.gz
           node setup-proxy.mjs > sb-config.json
