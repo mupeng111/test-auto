@@ -2,13 +2,14 @@ import { chromium } from 'playwright';
 import fs from 'fs';
 import path from 'path';
 
+// 从环境变量读取配置
 const PROXY_SERVER = process.env.PROXY_SERVER || '';
 const AXENT_COOKIES = process.env.AXENT_COOKIES || '';
 const AXENT_LOCAL_STORAGE = process.env.AXENT_LOCAL_STORAGE || '';
 const CLAIM_URL = 'https://app.axenthost.com/claim';
 const MAX_ATTEMPTS = 3;
 
-// 截图输出目录
+// 截图输出目录初始化
 const SCREENSHOT_DIR = 'screenshots';
 if (!fs.existsSync(SCREENSHOT_DIR)) {
   fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
@@ -16,6 +17,7 @@ if (!fs.existsSync(SCREENSHOT_DIR)) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// 保存页面截图工具函数
 async function takeScreenshot(page, name) {
   try {
     const filePath = path.join(SCREENSHOT_DIR, `${Date.now()}-${name}.png`);
@@ -26,7 +28,7 @@ async function takeScreenshot(page, name) {
   }
 }
 
-// 模拟 ESC，安全关闭可能遮挡的模态弹窗
+// 模拟 ESC，安全关闭可能遮挡的模态弹窗/广告
 async function dismissAdModals(page) {
   try {
     await page.keyboard.press('Escape');
@@ -67,11 +69,13 @@ async function getTurnstileWidget(page) {
   return null;
 }
 
+// Cloudflare Turnstile 人机验证求解核心逻辑
 async function waitAndSolveTurnstile(page, attemptIndex) {
   console.log('[turnstile] waiting for verification (passive first)...');
   const startedAt = Date.now();
   const waitedSec = () => Math.round((Date.now() - startedAt) / 1000);
 
+  // 判定是否已通过验证
   const checkPassed = async () => {
     const hasToken = await page.evaluate(() => {
       const input = document.querySelector('input[name="cf-turnstile-response"], input[name*="turnstile-response"]');
@@ -127,6 +131,7 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
     const dy = Math.round(box.height / 2 + (Math.random() * 6 - 3));
     const cx = Math.round(box.x + dx);
     const cy = Math.round(box.y + dy);
+    // 模拟平滑鼠标轨迹移动
     await page.mouse.move(cx - 64, cy - 28, { steps: 9 });
     await sleep(220);
     await page.mouse.move(cx, cy, { steps: 13 });
@@ -154,6 +159,8 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
   await takeScreenshot(page, `attempt${attemptIndex}-turnstile-timeout`);
   return false;
 }
+
+// 单次尝试领取操作
 async function claimOnce(context, attemptIndex) {
   const page = await context.newPage();
 
@@ -241,6 +248,8 @@ async function claimOnce(context, attemptIndex) {
     await page.close().catch(() => {});
   }
 }
+
+// 主执行程序入口
 (async () => {
   const launchOpts = {
     headless: false,
@@ -324,6 +333,7 @@ async function claimOnce(context, attemptIndex) {
     }
   }
 
+  // 冷却时间字符串转秒数辅助函数
   const cooldownToSeconds = (value) => {
     if (!value) return null;
     const parts = String(value).split(':').map(Number);
@@ -335,6 +345,8 @@ async function claimOnce(context, attemptIndex) {
   let claimedCount = 0;
   let failures = 0;
   let waitedShortCooldown = false;
+
+  // 尝试循环领取，上限打满 5 次或遇冷却中断
   for (let attemptNo = 1; ; attemptNo++) {
     console.log(`[run] attempt ${attemptNo}`);
     result = await claimOnce(context, attemptNo);
@@ -364,9 +376,10 @@ async function claimOnce(context, attemptIndex) {
   }
   console.log(`[claim] total claimed this run: ${claimedCount}`);
 
+  // 运行成功后，过滤并导出最新登录态文件供 Actions 写入 Secrets
   if (result.ok || result.reason === 'cooldown-or-already-claimed') {
     try {
-            const mappedAll = (await context.cookies()).map((c) => ({
+      const mappedAll = (await context.cookies()).map((c) => ({
         name: c.name,
         value: c.value,
         domain: c.domain,
