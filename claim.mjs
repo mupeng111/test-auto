@@ -179,16 +179,23 @@ async function claimOnce(context, attemptIndex) {
       return { ok: false, reason: 'cookies-expired-or-not-logged-in' };
     }
 
-    // 检查是否处于冷却中（需包含明确的时间，如 Claims refill in 45:14）
-    const isCooling = await page.evaluate(() => {
-      const refillMatch = document.body.innerText.match(/Claims refill in\s*(\d+:\d+)/i);
-      return refillMatch ? refillMatch[1] : null;
+    // 按剩余次数判定可用性：X/5 claims 是剩余可领次数，领完时显示 All 5 hourly claims used（剩余 >0 时也会同时显示回填倒计时，不能据此判定冷却）
+    const availability = await page.evaluate(() => {
+      const text = document.body.innerText;
+      const usedAll = /All 5 hourly claims used/i.test(text);
+      const remMatch = text.match(/(\d+)\s*\/\s*5\s*claims?/i);
+      const refillMatch = text.match(/Claims refill in\s*(\d+:\d+(?::\d+)?)/i);
+      return {
+        remaining: usedAll ? 0 : remMatch ? parseInt(remMatch[1], 10) : null,
+        refill: refillMatch ? refillMatch[1] : null,
+      };
     });
+    console.log(`[claim] remaining claims: ${availability.remaining === null ? 'unknown' : availability.remaining}`);
 
-    if (isCooling) {
-      console.log(`[claim] currently in cooldown: ${isCooling}`);
+    if (availability.remaining === 0 || (availability.remaining === null && availability.refill)) {
+      console.log(`[claim] currently in cooldown: ${availability.refill || 'unknown'}`);
       await takeScreenshot(page, `attempt${attemptIndex}-in-cooldown`);
-      return { ok: true, reason: 'cooldown-or-already-claimed', cooldown: isCooling };
+      return { ok: true, reason: 'cooldown-or-already-claimed', cooldown: availability.refill || undefined, remaining: availability.remaining };
     }
 
     // 处理 Turnstile 验证
@@ -216,15 +223,21 @@ async function claimOnce(context, attemptIndex) {
     await sleep(5000);
     await takeScreenshot(page, `attempt${attemptIndex}-after-click-claim3`);
 
-    // 结果校验
+    // 结果校验：领取后重新读取剩余次数，剩余减少即视为本次领到
     const resultText = (await page.textContent('body').catch(() => '')) || '';
-    const afterRefill = resultText.match(/Claims refill in\s*(\d+:\d+)/i);
+    const afterRefill = resultText.match(/Claims refill in\s*(\d+:\d+(?::\d+)?)/i);
+    const usedAllAfter = /All 5 hourly claims used/i.test(resultText);
+    const remAfterMatch = resultText.match(/(\d+)\s*\/\s*5\s*claims?/i);
+    const remainingAfter = usedAllAfter ? 0 : remAfterMatch ? parseInt(remAfterMatch[1], 10) : null;
+    console.log(`[claim] remaining after claim: ${remainingAfter === null ? 'unknown' : remainingAfter}`);
 
-    if (/success|claimed|\+3/i.test(resultText) || afterRefill) {
+    const claimedOnce = (remainingAfter !== null && availability.remaining !== null && remainingAfter < availability.remaining) || /success|\+3/i.test(resultText);
+    if (claimedOnce || (availability.remaining === null && !!afterRefill)) {
       const bal = resultText.match(/(\d+)\s*credits?/i);
       return {
         ok: true,
         balance: bal ? bal[1] : 'updated',
+        remaining: remainingAfter,
         cooldown: afterRefill ? afterRefill[1] : undefined,
       };
     }
