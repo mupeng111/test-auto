@@ -69,35 +69,21 @@ async function getTurnstileWidget(page) {
 
 async function waitAndSolveTurnstile(page, attemptIndex) {
   console.log('[turnstile] waiting for verification...');
+async function waitAndSolveTurnstile(page, attemptIndex) {
+  console.log('[turnstile] waiting for verification (passive first)...');
+  const startedAt = Date.now();
+  const waitedSec = () => Math.round((Date.now() - startedAt) / 1000);
 
-  // 1. 等待可能的前置倒计时 (如 Verifying you're human in 0:0X)
-  for (let i = 0; i < 8; i++) {
-    const isCountingDown = await page.evaluate(() => {
-      return document.body.innerText.includes("Verifying you're human in");
-    }).catch(() => false);
-
-    if (!isCountingDown) break;
-    console.log('[turnstile] waiting for countdown timer to finish...');
-    await sleep(2000);
-  }
-
-  // 2. 轮询并精确命中 24x24 空白复选框正中心
-  for (let i = 0; i < 15; i++) {
-    await dismissAdModals(page);
-
-    // 检查隐藏输入框是否已生成 cf-turnstile-response Token
+  const checkPassed = async () => {
     const hasToken = await page.evaluate(() => {
       const input = document.querySelector('input[name="cf-turnstile-response"], input[name*="turnstile-response"]');
       return !!(input && input.value && input.value.length > 20);
     }).catch(() => false);
-
-    // 检查页面提示
+    if (hasToken) console.log('[turnstile] token seen');
     const isVerifiedText = await page.evaluate(() => {
       const text = document.body.innerText;
       return text.includes('Verified, you are human') || text.includes('成功！');
     }).catch(() => false);
-
-    // 检查领取按钮是否已激活（非 disabled 且无 Securing）
     const isBtnReady = await page.evaluate(() => {
       const btn = Array.from(document.querySelectorAll('button')).find((b) =>
         b.textContent.includes('Claim 3 credits')
@@ -105,66 +91,57 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
       const isSecuring = document.body.innerText.includes('Securing your claim');
       return btn && !btn.disabled && !isSecuring;
     }).catch(() => false);
+    return hasToken || isVerifiedText || isBtnReady;
+  };
 
-    if (hasToken || isVerifiedText || isBtnReady) {
-      console.log('[turnstile] verification passed successfully!');
+  await dismissAdModals(page);
+
+  // 阶段 1：被动等待组件自解，最长约 60 秒；Securing 期间不点击任何东西
+  for (let i = 0; i < 30; i++) {
+    if (await checkPassed()) {
+      console.log(`[turnstile] passed without click, securing waited ${waitedSec()}s`);
       await takeScreenshot(page, `attempt${attemptIndex}-turnstile-passed`);
       return true;
     }
-
-    // 获取可见的 Turnstile iframe
-    const widget = await getTurnstileWidget(page);
-
-    if (widget) {
-      const { frameEl, box } = widget;
-
-      // 24x24 方框在 iframe 内部的中心点微调（24 为几何中心，20 与 28 为容错点）
-      const relativeOffsets = [24, 20, 28];
-      const relX = relativeOffsets[i % relativeOffsets.length];
-      const relY = Math.round(box.height / 2); // 垂直正中心约为 32px
-
-      const absX = Math.round(box.x + relX);
-      const absY = Math.round(box.y + relY);
-
-      console.log(`[turnstile] attempt ${i + 1}: clicking 24x24 checkbox center at (${absX}, ${absY}) [relative: (${relX}, ${relY})]`);
-
-      // 聚焦 iframe
-      await frameEl.focus().catch(() => {});
-      await sleep(100);
-
-      // 方法 1：通过 ElementHandle 派发相对位置点击
-      try {
-        await frameEl.click({
-          position: { x: relX, y: relY },
-          delay: 80,
-          timeout: 2500,
-          force: true,
-        });
-      } catch {}
-
-      // 方法 2：模拟自然鼠标轨迹移动与点击作为物理兜底
-      try {
-        await page.mouse.move(absX - 25, absY, { steps: 5 });
-        await sleep(50);
-        await page.mouse.move(absX, absY, { steps: 5 });
-        await sleep(100);
-        await page.mouse.down();
-        await sleep(80);
-        await page.mouse.up();
-      } catch {}
-    } else {
-      console.log(`[turnstile] attempt ${i + 1}: widget frame not found or not ready yet`);
-    }
-
-    await sleep(2500);
+    if (i % 10 === 0) console.log(`[turnstile] securing waited ${waitedSec()}s`);
+    await sleep(2000);
   }
 
-  console.log('[turnstile] timeout waiting for pass');
+  // 阶段 2：出现可见复选框时用慢速轨迹单点，本次尝试最多 2 次点完后各等约 30 秒
+  for (let clickNo = 1; clickNo <= 2; clickNo++) {
+    const widget = await getTurnstileWidget(page);
+    if (!widget) {
+      console.log('[turnstile] checkbox not visible');
+      break;
+    }
+    const { box } = widget;
+    const cx = Math.round(box.x + 24);
+    const cy = Math.round(box.y + box.height / 2);
+    await page.mouse.move(cx - 60, cy - 24, { steps: 8 });
+    await sleep(300);
+    await page.mouse.move(cx, cy, { steps: 12 });
+    await sleep(450);
+    await page.mouse.down();
+    await sleep(90);
+    await page.mouse.up();
+    console.log(`[turnstile] checkbox clicked (${clickNo}/2)`);
+    await sleep(400);
+
+    for (let i = 0; i < 15; i++) {
+      await sleep(2000);
+      if (await checkPassed()) {
+        console.log(`[turnstile] passed after click, securing waited ${waitedSec()}s`);
+        await takeScreenshot(page, `attempt${attemptIndex}-turnstile-passed`);
+        return true;
+      }
+    }
+    console.log('[turnstile] still no token after click');
+  }
+
+  console.log(`[turnstile] timeout waiting for pass after ${waitedSec()}s`);
   await takeScreenshot(page, `attempt${attemptIndex}-turnstile-timeout`);
   return false;
 }
-
-async function claimOnce(context, attemptIndex) {
   const page = await context.newPage();
 
   try {
@@ -251,10 +228,9 @@ async function claimOnce(context, attemptIndex) {
     await page.close().catch(() => {});
   }
 }
-
 (async () => {
   const launchOpts = {
-    headless: true,
+    headless: false,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -274,6 +250,7 @@ async function claimOnce(context, attemptIndex) {
     userAgent:
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
     locale: 'en-US',
+        timezoneId: 'America/New_York',
   });
 
   // 1. 注入 LocalStorage
