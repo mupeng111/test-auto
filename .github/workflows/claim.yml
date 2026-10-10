@@ -111,3 +111,23 @@ jobs:
             fi
           done
 
+
+      - name: Notify Telegram on failure
+        if: failure()
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "Telegram secrets not set, skip failure notification"
+            exit 0
+          fi
+          MSG="❌ GitHub Actions 失败通知
+          workflow: ${{ github.workflow }}
+          run: #${{ github.run_number }} (event: ${{ github.event_name }})
+          url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            --data-urlencode text="${MSG}" >/dev/null || true
+          echo "Telegram failure notification attempted"
