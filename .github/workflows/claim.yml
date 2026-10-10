@@ -7,6 +7,9 @@ on:
 jobs:
   claim:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -64,6 +67,23 @@ jobs:
           PROXY_SERVER: ${{ env.PROXY_SERVER }}
         run: node claim.mjs
 
+      - name: Refresh login secrets
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "GH_PAT not set, skip"
+            exit 0
+          fi
+          if [ -f fresh-cookies.json ]; then
+            gh secret set AXENT_COOKIES --repo ${{ github.repository }} < fresh-cookies.json
+          fi
+          if [ -f fresh-localstorage.json ]; then
+            gh secret set AXENT_LOCAL_STORAGE --repo ${{ github.repository }} < fresh-localstorage.json
+          fi
+          rm -f fresh-cookies.json fresh-localstorage.json
+
       - name: upload debug screenshots
         if: always()
         uses: actions/upload-artifact@v4
@@ -71,3 +91,15 @@ jobs:
           name: claim-debug-screenshots
           path: screenshots/
           retention-days: 1
+
+      - name: Cleanup old workflow runs
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for run_id in $(gh api "repos/${{ github.repository }}/actions/workflows/claim.yml/runs?per_page=100" --jq '.workflow_runs[].id'); do
+            if [ "$run_id" != "${{ github.run_id }}" ]; then
+              gh api -X DELETE "repos/${{ github.repository }}/actions/runs/$run_id" || true
+            fi
+          done
+
