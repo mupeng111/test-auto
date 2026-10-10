@@ -142,6 +142,7 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
   await takeScreenshot(page, `attempt${attemptIndex}-turnstile-timeout`);
   return false;
 }
+async function claimOnce(context, attemptIndex) {
   const page = await context.newPage();
 
   try {
