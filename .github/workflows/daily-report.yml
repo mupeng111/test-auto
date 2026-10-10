@@ -1,0 +1,68 @@
+name: tg-daily-report
+
+on:
+  schedule:
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: read
+
+jobs:
+  daily-report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build daily report
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set +e
+          REPO="${{ github.repository }}"
+          TODAY=$(TZ=Asia/Shanghai date +%F)
+          RUN_JSON=$(gh api "repos/$REPO/actions/workflows/claim.yml/runs?per_page=20&status=completed" 2>/dev/null || echo '{}')
+          RUN_ID=$(echo "$RUN_JSON" | jq -r '.workflow_runs[0].id // empty')
+          RUN_NUM=$(echo "$RUN_JSON" | jq -r '.workflow_runs[0].run_number // empty')
+          RUN_EVENT=$(echo "$RUN_JSON" | jq -r '.workflow_runs[0].event // empty')
+          RUN_CONC=$(echo "$RUN_JSON" | jq -r '.workflow_runs[0].conclusion // empty')
+          RUN_AT=$(echo "$RUN_JSON" | jq -r '.workflow_runs[0].created_at // empty')
+          TOTAL="未读到"
+          FINAL="未读到"
+          ENTRY="未读到"
+          REASON=""
+          if [ -n "$RUN_ID" ]; then
+            gh api "repos/$REPO/actions/runs/$RUN_ID/logs" > run-logs.zip 2>/dev/null || true
+            mkdir -p run-logs
+            unzip -o -q run-logs.zip -d run-logs 2>/dev/null || true
+            LOGTXT=$(cat run-logs/*/*.txt 2>/dev/null)
+            T=$(echo "$LOGTXT" | grep -oE 'total claimed this run: [0-9]+' | tail -1)
+            [ -n "$T" ] && TOTAL="$T"
+            E=$(echo "$LOGTXT" | grep -oE 'remaining claims: [0-9]+' | head -1)
+            [ -n "$E" ] && ENTRY="$E"
+            F=$(echo "$LOGTXT" | grep 'FINAL:' | tail -1 | sed 's/.*FINAL: //')
+            [ -n "$F" ] && FINAL="$F"
+            REASON=$(echo "$LOGTXT" | grep -oE '"reason":"[^"]+"' | tail -1)
+          fi
+          MSG="📊 Axent 每日汇报 ($TODAY)
+          最新运行: #${RUN_NUM:-?} 触发: ${RUN_EVENT:-?} 结论: ${RUN_CONC:-?}
+          创建时间(UTC): ${RUN_AT:-?}
+          进入时剩余: ${ENTRY}
+          最近领取: ${TOTAL}
+          最终结果: ${FINAL}"
+          if [ "$RUN_CONC" = "failure" ]; then
+            MSG="${MSG}
+          ⚠️ 最新运行失败，类别参考: ${REASON:-未读到}"
+          fi
+          echo "----- daily report -----"
+          echo "$MSG"
+          echo "------------------------"
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "Telegram secrets not set, skip sending"
+            exit 0
+          fi
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            --data-urlencode text="$MSG" >/dev/null || true
+          echo "Telegram daily report attempted"
