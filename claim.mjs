@@ -68,8 +68,6 @@ async function getTurnstileWidget(page) {
 }
 
 async function waitAndSolveTurnstile(page, attemptIndex) {
-  console.log('[turnstile] waiting for verification...');
-async function waitAndSolveTurnstile(page, attemptIndex) {
   console.log('[turnstile] waiting for verification (passive first)...');
   const startedAt = Date.now();
   const waitedSec = () => Math.round((Date.now() - startedAt) / 1000);
