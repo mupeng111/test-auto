@@ -105,35 +105,49 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
     await sleep(2000);
   }
 
-  // 阶段 2：出现可见复选框时用慢速轨迹单点，本次尝试最多 2 次点完后各等约 30 秒
+  // 阶段 2：出现可见复选框时：现算坐标 + 单次慢点，本次尝试最多 2 次，点后各等最长 60 秒
   for (let clickNo = 1; clickNo <= 2; clickNo++) {
-    const widget = await getTurnstileWidget(page);
+    let widget = await getTurnstileWidget(page);
     if (!widget) {
       console.log('[turnstile] checkbox not visible');
       break;
     }
-    const { box } = widget;
-    const cx = Math.round(box.x + 24);
-    const cy = Math.round(box.y + box.height / 2);
-    await page.mouse.move(cx - 60, cy - 24, { steps: 8 });
-    await sleep(300);
-    await page.mouse.move(cx, cy, { steps: 12 });
-    await sleep(450);
-    await page.mouse.down();
-    await sleep(90);
-    await page.mouse.up();
-    console.log(`[turnstile] checkbox clicked (${clickNo}/2)`);
-    await sleep(400);
-
-    for (let i = 0; i < 15; i++) {
-      await sleep(2000);
-      if (await checkPassed()) {
-        console.log(`[turnstile] passed after click, securing waited ${waitedSec()}s`);
-        await takeScreenshot(page, `attempt${attemptIndex}-turnstile-passed`);
-        return true;
-      }
+    try {
+      await widget.frameEl.scrollIntoViewIfNeeded();
+    } catch (e) {}
+    await sleep(1000);
+    // 点击前重新读取组件位置，避免广告位移导致旧坐标失效
+    widget = await getTurnstileWidget(page);
+    if (!widget || !widget.box) {
+      console.log('[turnstile] checkbox not visible after scroll');
+      break;
     }
-    console.log('[turnstile] still no token after click');
+    const box = widget.box;
+    const dx = 26 + Math.round(Math.random() * 6 - 3);
+    const dy = Math.round(box.height / 2 + (Math.random() * 6 - 3));
+    const cx = Math.round(box.x + dx);
+    const cy = Math.round(box.y + dy);
+    await page.mouse.move(cx - 64, cy - 28, { steps: 9 });
+    await sleep(220);
+    await page.mouse.move(cx, cy, { steps: 13 });
+    await sleep(300 + Math.floor(Math.random() * 300));
+    await page.mouse.down();
+    await sleep(80 + Math.floor(Math.random() * 80));
+    await page.mouse.up();
+    console.log(
+      `[turnstile] checkbox clicked (${clickNo}/2) at widget offset dx=${dx} dy=${dy}`
+    );
+    await sleep(500);
+    let passedAfterClick = false;
+    for (let i = 0; i < 20; i++) {
+      if (await checkPassed()) {
+        passedAfterClick = true;
+        break;
+      }
+      if (i === 19) console.log('[turnstile] still no token after click');
+      await sleep(3000);
+    }
+    if (passedAfterClick) return true;
   }
 
   console.log(`[turnstile] timeout waiting for pass after ${waitedSec()}s`);
@@ -243,14 +257,36 @@ async function claimOnce(context, attemptIndex) {
     console.log('[proxy] using', PROXY_SERVER);
   }
 
-  const browser = await chromium.launch(launchOpts);
+  let browser;
+  let browserKind = 'chromium (bundled)';
+  try {
+    browser = await chromium.launch({ ...launchOpts, channel: 'chrome' });
+    browserKind = 'chrome (system)';
+  } catch (e) {
+    console.log('[browser] chrome channel failed, falling back to bundled chromium');
+    browser = await chromium.launch(launchOpts);
+  }
+  console.log(`[browser] launched with ${browserKind}`);
   const context = await browser.newContext({
     viewport: { width: 1920, height: 1080 },
-    userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
     locale: 'en-US',
-        timezoneId: 'America/New_York',
+    timezoneId: 'America/New_York',
   });
+
+  // 指纹补齐（低调）：隐藏自动化标记并补齐常见浏览器特征
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    if (!window.chrome) window.chrome = { runtime: {} };
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+    Object.defineProperty(navigator, 'plugins', {
+      get: () => [
+        { name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+        { name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+        { name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+      ],
+    });
+  });
+  console.log('[browser] fingerprint init script added');
 
   // 1. 注入 LocalStorage
   if (AXENT_LOCAL_STORAGE) {
