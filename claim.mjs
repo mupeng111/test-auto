@@ -309,6 +309,30 @@ async function claimOnce(context, attemptIndex) {
     await sleep(8000);
   }
 
+  if (result.ok || result.reason === 'cooldown-or-already-claimed') {
+    try {
+      const freshCookies = (await context.cookies()).map((c) => ({
+        name: c.name,
+        value: c.value,
+        domain: c.domain,
+        path: c.path,
+        expirationDate: c.expires,
+        httpOnly: c.httpOnly,
+        secure: c.secure,
+        sameSite: c.sameSite,
+      }));
+      fs.writeFileSync('fresh-cookies.json', JSON.stringify(freshCookies, null, 2));
+      const state = await context.storageState();
+      const axentOrigin = (state.origins || []).find((o) => o.origin === 'https://app.axenthost.com');
+      const freshStorage = {};
+      for (const item of axentOrigin?.localStorage || []) freshStorage[item.name] = item.value;
+      fs.writeFileSync('fresh-localstorage.json', JSON.stringify(freshStorage, null, 2));
+      console.log(`[auth] exported fresh login state: ${freshCookies.length} cookies, ${Object.keys(freshStorage).length} localStorage items`);
+    } catch {
+      console.log('[auth] failed to export fresh login state');
+    }
+  }
+
   await browser.close();
   console.log('FINAL:', JSON.stringify(result));
 
