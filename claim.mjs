@@ -366,7 +366,7 @@ async function claimOnce(context, attemptIndex) {
 
   if (result.ok || result.reason === 'cooldown-or-already-claimed') {
     try {
-      const freshCookies = (await context.cookies()).map((c) => ({
+            const mappedAll = (await context.cookies()).map((c) => ({
         name: c.name,
         value: c.value,
         domain: c.domain,
@@ -376,13 +376,28 @@ async function claimOnce(context, attemptIndex) {
         secure: c.secure,
         sameSite: c.sameSite,
       }));
-      fs.writeFileSync('fresh-cookies.json', JSON.stringify(freshCookies, null, 2));
+      const keepCookie = (item) => {
+        const host = (item.domain || '').replace(/^\./, '').toLowerCase();
+        return (
+          host === 'axenthost.com' ||
+          host.endsWith('.axenthost.com') ||
+          host === 'challenges.cloudflare.com' ||
+          host === 'cloudflare.com' ||
+          host.endsWith('.cloudflare.com')
+        );
+      };
+      const freshCookies = mappedAll.filter(keepCookie);
+      const cookiesJson = JSON.stringify(freshCookies);
+      fs.writeFileSync('fresh-cookies.json', cookiesJson);
       const state = await context.storageState();
       const axentOrigin = (state.origins || []).find((o) => o.origin === 'https://app.axenthost.com');
       const freshStorage = {};
       for (const item of axentOrigin?.localStorage || []) freshStorage[item.name] = item.value;
-      fs.writeFileSync('fresh-localstorage.json', JSON.stringify(freshStorage, null, 2));
-      console.log(`[auth] exported fresh login state: ${freshCookies.length} cookies, ${Object.keys(freshStorage).length} localStorage items`);
+      const storageJson = JSON.stringify(freshStorage);
+      fs.writeFileSync('fresh-localstorage.json', storageJson);
+      console.log(
+        `[auth] exported fresh login state: cookies ${freshCookies.length}/${mappedAll.length} kept (${Buffer.byteLength(cookiesJson)} bytes), localStorage ${Object.keys(freshStorage).length} items (${Buffer.byteLength(storageJson)} bytes)`
+      );
     } catch {
       console.log('[auth] failed to export fresh login state');
     }
