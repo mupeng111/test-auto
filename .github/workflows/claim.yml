@@ -77,20 +77,34 @@ jobs:
 
       - name: Refresh login secrets
         if: always()
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           if [ -z "$GH_TOKEN" ]; then
-            echo "GH_PAT not set, skip"
+            echo "GH_PAT not set, skipping secret refresh"
             exit 0
           fi
+          COOKIE_STATUS="skipped (no file)"
+          STORAGE_STATUS="skipped (no file)"
           if [ -f fresh-cookies.json ]; then
-            gh secret set AXENT_COOKIES --repo ${{ github.repository }} < fresh-cookies.json
+            if gh secret set AXENT_COOKIES --repo ${{ github.repository }} < fresh-cookies.json; then
+              COOKIE_STATUS="updated"
+            else
+              COOKIE_STATUS="FAILED"
+              echo "::warning::failed to refresh AXENT_COOKIES"
+            fi
           fi
           if [ -f fresh-localstorage.json ]; then
-            gh secret set AXENT_LOCAL_STORAGE --repo ${{ github.repository }} < fresh-localstorage.json
+            if gh secret set AXENT_LOCAL_STORAGE --repo ${{ github.repository }} < fresh-localstorage.json; then
+              STORAGE_STATUS="updated"
+            else
+              STORAGE_STATUS="FAILED"
+              echo "::warning::failed to refresh AXENT_LOCAL_STORAGE"
+            fi
           fi
           rm -f fresh-cookies.json fresh-localstorage.json
+          echo "Refresh summary: AXENT_COOKIES=$COOKIE_STATUS, AXENT_LOCAL_STORAGE=$STORAGE_STATUS"
 
       - name: upload debug screenshots
         if: always()
@@ -127,7 +141,7 @@ jobs:
           workflow: ${{ github.workflow }}
           run: #${{ github.run_number }} (event: ${{ github.event_name }})
           url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+          RESP=$(curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
-            --data-urlencode text="${MSG}" >/dev/null || true
-          echo "Telegram failure notification attempted"
+            --data-urlencode text="${MSG}")
+          echo "Telegram response: ${RESP}"
