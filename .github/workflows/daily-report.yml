@@ -62,7 +62,7 @@ jobs:
             echo "Telegram secrets not set, skip sending"
             exit 0
           fi
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+          RESP=$(curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
-            --data-urlencode text="$MSG" >/dev/null || true
-          echo "Telegram daily report attempted"
+            --data-urlencode text="${MSG}")
+          echo "Telegram response: ${RESP}"
