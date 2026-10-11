@@ -26,7 +26,7 @@ function parseProxy(link) {
     if (params.security === 'reality') {
       outbound.tls = {
         enabled: true,
-        server_name: params.sni || url.hostname,
+        server_name: params.sni || params.host || url.hostname,
         reality: {
           enabled: true,
           public_key: params.pbk || '',
@@ -37,7 +37,7 @@ function parseProxy(link) {
     } else if (params.security === 'tls') {
       outbound.tls = {
         enabled: true,
-        server_name: params.sni || url.hostname,
+        server_name: params.sni || params.host || url.hostname,
         insecure: params.allowInsecure === '1',
       };
       if (params.fp) outbound.tls.utls = { enabled: true, fingerprint: params.fp };
