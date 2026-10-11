@@ -1,6 +1,6 @@
 import { chromium } from 'playwright';
 import fs from 'fs';
-import path from 'path';
+import path from 'path'; import zlib from 'zlib'; /* localStorage 导出超 45000 字节自动 gzip+base64 打包（'GZIP1:' 前缀），注入时自动识别解压；旧明文 JSON 照常解析 */ function packSecretValue(jsonStr) { const rawBytes = Buffer.byteLength(jsonStr); if (rawBytes <= 45000) return { value: jsonStr, compressed: false, bytes: rawBytes, rawBytes }; const packed = 'GZIP1:' + zlib.gzipSync(Buffer.from(jsonStr, 'utf8')).toString('base64'); return { value: packed, compressed: true, bytes: Buffer.byteLength(packed), rawBytes }; } function unpackSecretValue(str) { if (typeof str === 'string' && str.startsWith('GZIP1:')) return zlib.gunzipSync(Buffer.from(str.slice(6), 'base64')).toString('utf8'); return str; }
 
 // 从环境变量读取配置
 const PROXY_SERVER = process.env.PROXY_SERVER || '';
@@ -300,7 +300,7 @@ async function claimOnce(context, attemptIndex) {
   // 1. 注入 LocalStorage
   if (AXENT_LOCAL_STORAGE) {
     try {
-      const storage = JSON.parse(AXENT_LOCAL_STORAGE);
+      const storage = JSON.parse(unpackSecretValue(AXENT_LOCAL_STORAGE));
       await context.addInitScript((items) => {
         for (const [k, v] of Object.entries(items)) {
           window.localStorage.setItem(k, v);
@@ -406,10 +406,10 @@ async function claimOnce(context, attemptIndex) {
       const axentOrigin = (state.origins || []).find((o) => o.origin === 'https://app.axenthost.com');
       const freshStorage = {}; /* localStorage key 过滤：只丢弃明显广告/追踪垃圾键，保留一切可能与登录态有关的东西；仅按 key 名称匹配（大小写不敏感），其余 key 即使体积大也保留 */ const AD_JUNK_KEY_RE = /ad[s]?[\W_]|ads_|doubleclick|_ga|_fbp|_fbc|analytics|pixel|intercom|hotjar|clarity|matomo|segment|rudderstack|amplitude|mixpanel|sentry|bugsnag|newrelic|optimizely|ab[_-]?test|gtm|tagmanager|adsense|taboola|outbrain|criteo|pubmatic|prebid|appnexus|foundayo/i; const allStorageItems = axentOrigin?.localStorage || []; const droppedStorageKeys = [];
       for (const item of allStorageItems) { if (AD_JUNK_KEY_RE.test(item.name)) { droppedStorageKeys.push(item.name); continue; } freshStorage[item.name] = item.value; }
-      const storageJson = JSON.stringify(freshStorage);
-      fs.writeFileSync('fresh-localstorage.json', storageJson); if (droppedStorageKeys.length > 0) { console.log(`[auth] localStorage dropped ${droppedStorageKeys.length} ad/tracker junk keys: ${droppedStorageKeys.join(', ')}`); } /* 按字节数打印体积最大的前 8 个 key（仅名称+字节数，不打印值），方便核对误杀/漏杀 */ const storageKeySizes = Object.entries(freshStorage).map(([k, v]) => ({ key: k, bytes: Buffer.byteLength(String(v)) })).sort((a, b) => b.bytes - a.bytes).slice(0, 8); for (const { key, bytes } of storageKeySizes) { console.log(`[auth] localStorage key size: ${key} (${bytes} bytes)`); }
+      const storageJsonRaw = JSON.stringify(freshStorage); const storageJsonPacked = packSecretValue(storageJsonRaw);
+      fs.writeFileSync('fresh-localstorage.json', storageJsonPacked.value); if (droppedStorageKeys.length > 0) { console.log(`[auth] localStorage dropped ${droppedStorageKeys.length} ad/tracker junk keys: ${droppedStorageKeys.join(', ')}`); } /* 按字节数打印体积最大的前 8 个 key（仅名称+字节数，不打印值），方便核对误杀/漏杀 */ const storageKeySizes = Object.entries(freshStorage).map(([k, v]) => ({ key: k, bytes: Buffer.byteLength(String(v)) })).sort((a, b) => b.bytes - a.bytes).slice(0, 8); for (const { key, bytes } of storageKeySizes) { console.log(`[auth] localStorage key size: ${key} (${bytes} bytes)`); }
       console.log(
-        `[auth] exported fresh login state: cookies ${freshCookies.length}/${mappedAll.length} kept (${Buffer.byteLength(cookiesJson)} bytes), localStorage ${Object.keys(freshStorage).length}/${allStorageItems.length} kept (${Buffer.byteLength(storageJson)} bytes)`
+        `[auth] exported fresh login state: cookies ${freshCookies.length}/${mappedAll.length} kept (${Buffer.byteLength(cookiesJson)} bytes), localStorage ${Object.keys(freshStorage).length}/${allStorageItems.length} kept (raw ${storageJsonPacked.rawBytes} bytes, ${storageJsonPacked.compressed ? 'gzip' : 'plain'}, final ${storageJsonPacked.bytes} bytes)`
       );
     } catch {
       console.log('[auth] failed to export fresh login state');
