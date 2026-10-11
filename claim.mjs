@@ -404,12 +404,12 @@ async function claimOnce(context, attemptIndex) {
       fs.writeFileSync('fresh-cookies.json', cookiesJson);
       const state = await context.storageState();
       const axentOrigin = (state.origins || []).find((o) => o.origin === 'https://app.axenthost.com');
-      const freshStorage = {};
-      for (const item of axentOrigin?.localStorage || []) freshStorage[item.name] = item.value;
+      const freshStorage = {}; /* localStorage key 过滤：只丢弃明显广告/追踪垃圾键，保留一切可能与登录态有关的东西；仅按 key 名称匹配（大小写不敏感），其余 key 即使体积大也保留 */ const AD_JUNK_KEY_RE = /ad[s]?[\W_]|ads_|doubleclick|_ga|_fbp|_fbc|analytics|pixel|intercom|hotjar|clarity|matomo|segment|rudderstack|amplitude|mixpanel|sentry|bugsnag|newrelic|optimizely|ab[_-]?test|gtm|tagmanager|adsense|taboola|outbrain|criteo|pubmatic|prebid|appnexus|foundayo/i; const allStorageItems = axentOrigin?.localStorage || []; const droppedStorageKeys = [];
+      for (const item of allStorageItems) { if (AD_JUNK_KEY_RE.test(item.name)) { droppedStorageKeys.push(item.name); continue; } freshStorage[item.name] = item.value; }
       const storageJson = JSON.stringify(freshStorage);
-      fs.writeFileSync('fresh-localstorage.json', storageJson);
+      fs.writeFileSync('fresh-localstorage.json', storageJson); if (droppedStorageKeys.length > 0) { console.log(`[auth] localStorage dropped ${droppedStorageKeys.length} ad/tracker junk keys: ${droppedStorageKeys.join(', ')}`); } /* 按字节数打印体积最大的前 8 个 key（仅名称+字节数，不打印值），方便核对误杀/漏杀 */ const storageKeySizes = Object.entries(freshStorage).map(([k, v]) => ({ key: k, bytes: Buffer.byteLength(String(v)) })).sort((a, b) => b.bytes - a.bytes).slice(0, 8); for (const { key, bytes } of storageKeySizes) { console.log(`[auth] localStorage key size: ${key} (${bytes} bytes)`); }
       console.log(
-        `[auth] exported fresh login state: cookies ${freshCookies.length}/${mappedAll.length} kept (${Buffer.byteLength(cookiesJson)} bytes), localStorage ${Object.keys(freshStorage).length} items (${Buffer.byteLength(storageJson)} bytes)`
+        `[auth] exported fresh login state: cookies ${freshCookies.length}/${mappedAll.length} kept (${Buffer.byteLength(cookiesJson)} bytes), localStorage ${Object.keys(freshStorage).length}/${allStorageItems.length} kept (${Buffer.byteLength(storageJson)} bytes)`
       );
     } catch {
       console.log('[auth] failed to export fresh login state');
