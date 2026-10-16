@@ -1,6 +1,22 @@
 import { chromium } from 'playwright';
 import fs from 'fs';
-import path from 'path'; import zlib from 'zlib'; /* localStorage 导出超 45000 字节自动 gzip+base64 打包（'GZIP1:' 前缀），注入时自动识别解压；旧明文 JSON 照常解析 */ function packSecretValue(jsonStr) { const rawBytes = Buffer.byteLength(jsonStr); if (rawBytes <= 45000) return { value: jsonStr, compressed: false, bytes: rawBytes, rawBytes }; const packed = 'GZIP1:' + zlib.gzipSync(Buffer.from(jsonStr, 'utf8')).toString('base64'); return { value: packed, compressed: true, bytes: Buffer.byteLength(packed), rawBytes }; } function unpackSecretValue(str) { if (typeof str === 'string' && str.startsWith('GZIP1:')) return zlib.gunzipSync(Buffer.from(str.slice(6), 'base64')).toString('utf8'); return str; }
+import path from 'path';
+import zlib from 'zlib';
+
+/* localStorage 导出超 45000 字节自动 gzip+base64 打包（'GZIP1:' 前缀），注入时自动识别解压；旧明文 JSON 照常解析 */
+function packSecretValue(jsonStr) {
+  const rawBytes = Buffer.byteLength(jsonStr);
+  if (rawBytes <= 45000) return { value: jsonStr, compressed: false, bytes: rawBytes, rawBytes };
+  const packed = 'GZIP1:' + zlib.gzipSync(Buffer.from(jsonStr, 'utf8')).toString('base64');
+  return { value: packed, compressed: true, bytes: Buffer.byteLength(packed), rawBytes };
+}
+
+function unpackSecretValue(str) {
+  if (typeof str === 'string' && str.startsWith('GZIP1:')) {
+    return zlib.gunzipSync(Buffer.from(str.slice(6), 'base64')).toString('utf8');
+  }
+  return str;
+}
 
 // 从环境变量读取配置
 const PROXY_SERVER = process.env.PROXY_SERVER || '';
@@ -402,11 +418,14 @@ async function claimOnce(context, attemptIndex) {
       const freshCookies = mappedAll.filter(keepCookie);
       const cookiesJson = JSON.stringify(freshCookies);
       fs.writeFileSync('fresh-cookies.json', cookiesJson);
-      const state = await context.storageState();
+
       const state = await context.storageState();
       const axentOrigin = (state.origins || []).find((o) => o.origin === 'https://app.axenthost.com');
+      const allStorageItems = axentOrigin?.localStorage || [];
       const freshStorage = {};
-      for (const item of axentOrigin?.localStorage || []) {
+      const droppedStorageKeys = [];
+
+      for (const item of allStorageItems) {
         const k = item.name;
         const v = item.value || '';
         // 过滤掉广告商前缀与超过 5000 字节的垃圾追踪数据，但强制保留 auth 核心凭据
@@ -415,17 +434,35 @@ async function claimOnce(context, attemptIndex) {
           /^(_|id5|33across|arcspan|nitro|au\/|BT_|pbjs|cto_|apstag|aps:|captify|idl_env|panorama|ntv|bb_uuid)/.test(k) ||
           k.includes('criteo') || k.includes('liveramp') || k.includes('openx') || k.includes('history')
         );
-        if (!isJunk) {
+        if (isJunk) {
+          droppedStorageKeys.push(k);
+        } else {
           freshStorage[k] = v;
         }
       }
-      const storageJsonRaw = JSON.stringify(freshStorage); const storageJsonPacked = packSecretValue(storageJsonRaw);
-      fs.writeFileSync('fresh-localstorage.json', storageJsonPacked.value); if (droppedStorageKeys.length > 0) { console.log(`[auth] localStorage dropped ${droppedStorageKeys.length} ad/tracker junk keys: ${droppedStorageKeys.join(', ')}`); } /* 按字节数打印体积最大的前 8 个 key（仅名称+字节数，不打印值），方便核对误杀/漏杀 */ const storageKeySizes = Object.entries(freshStorage).map(([k, v]) => ({ key: k, bytes: Buffer.byteLength(String(v)) })).sort((a, b) => b.bytes - a.bytes).slice(0, 8); for (const { key, bytes } of storageKeySizes) { console.log(`[auth] localStorage key size: ${key} (${bytes} bytes)`); }
+
+      const storageJsonRaw = JSON.stringify(freshStorage);
+      const storageJsonPacked = packSecretValue(storageJsonRaw);
+      fs.writeFileSync('fresh-localstorage.json', storageJsonPacked.value);
+
+      if (droppedStorageKeys.length > 0) {
+        console.log(`[auth] localStorage dropped ${droppedStorageKeys.length} ad/tracker junk keys: ${droppedStorageKeys.join(', ')}`);
+      }
+
+      /* 按字节数打印体积最大的前 8 个 key（仅名称+字节数，不打印值），方便核对误杀/漏杀 */
+      const storageKeySizes = Object.entries(freshStorage)
+        .map(([k, v]) => ({ key: k, bytes: Buffer.byteLength(String(v)) }))
+        .sort((a, b) => b.bytes - a.bytes)
+        .slice(0, 8);
+      for (const { key, bytes } of storageKeySizes) {
+        console.log(`[auth] localStorage key size: ${key} (${bytes} bytes)`);
+      }
+
       console.log(
         `[auth] exported fresh login state: cookies ${freshCookies.length}/${mappedAll.length} kept (${Buffer.byteLength(cookiesJson)} bytes), localStorage ${Object.keys(freshStorage).length}/${allStorageItems.length} kept (raw ${storageJsonPacked.rawBytes} bytes, ${storageJsonPacked.compressed ? 'gzip' : 'plain'}, final ${storageJsonPacked.bytes} bytes)`
       );
-    } catch {
-      console.log('[auth] failed to export fresh login state');
+    } catch (e) {
+      console.log('[auth] failed to export fresh login state:', e.message);
     }
   }
 
