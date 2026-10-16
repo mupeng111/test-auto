@@ -403,9 +403,22 @@ async function claimOnce(context, attemptIndex) {
       const cookiesJson = JSON.stringify(freshCookies);
       fs.writeFileSync('fresh-cookies.json', cookiesJson);
       const state = await context.storageState();
+      const state = await context.storageState();
       const axentOrigin = (state.origins || []).find((o) => o.origin === 'https://app.axenthost.com');
-      const freshStorage = {}; /* localStorage key 过滤：只丢弃明显广告/追踪垃圾键，保留一切可能与登录态有关的东西；仅按 key 名称匹配（大小写不敏感），其余 key 即使体积大也保留 */ const AD_JUNK_KEY_RE = /ad[s]?[\W_]|ads_|doubleclick|_ga|_fbp|_fbc|analytics|pixel|intercom|hotjar|clarity|matomo|segment|rudderstack|amplitude|mixpanel|sentry|bugsnag|newrelic|optimizely|ab[_-]?test|gtm|tagmanager|adsense|taboola|outbrain|criteo|pubmatic|prebid|appnexus|foundayo/i; const allStorageItems = axentOrigin?.localStorage || []; const droppedStorageKeys = [];
-      for (const item of allStorageItems) { if (AD_JUNK_KEY_RE.test(item.name)) { droppedStorageKeys.push(item.name); continue; } freshStorage[item.name] = item.value; }
+      const freshStorage = {};
+      for (const item of axentOrigin?.localStorage || []) {
+        const k = item.name;
+        const v = item.value || '';
+        // 过滤掉广告商前缀与超过 5000 字节的垃圾追踪数据，但强制保留 auth 核心凭据
+        const isJunk = k !== 'auth' && (
+          v.length > 5000 ||
+          /^(_|id5|33across|arcspan|nitro|au\/|BT_|pbjs|cto_|apstag|aps:|captify|idl_env|panorama|ntv|bb_uuid)/.test(k) ||
+          k.includes('criteo') || k.includes('liveramp') || k.includes('openx') || k.includes('history')
+        );
+        if (!isJunk) {
+          freshStorage[k] = v;
+        }
+      }
       const storageJsonRaw = JSON.stringify(freshStorage); const storageJsonPacked = packSecretValue(storageJsonRaw);
       fs.writeFileSync('fresh-localstorage.json', storageJsonPacked.value); if (droppedStorageKeys.length > 0) { console.log(`[auth] localStorage dropped ${droppedStorageKeys.length} ad/tracker junk keys: ${droppedStorageKeys.join(', ')}`); } /* 按字节数打印体积最大的前 8 个 key（仅名称+字节数，不打印值），方便核对误杀/漏杀 */ const storageKeySizes = Object.entries(freshStorage).map(([k, v]) => ({ key: k, bytes: Buffer.byteLength(String(v)) })).sort((a, b) => b.bytes - a.bytes).slice(0, 8); for (const { key, bytes } of storageKeySizes) { console.log(`[auth] localStorage key size: ${key} (${bytes} bytes)`); }
       console.log(
