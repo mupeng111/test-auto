@@ -286,6 +286,62 @@ async function checkTurnstileFailed(page) {
   }
 }
 
+// 诊断：列出页面上所有挑战 iframe 的外框与样式（排查坐标点击为何不生效）
+async function dumpChallengeFrames(page, tag) {
+  try {
+    for (const frame of page.frames()) {
+      if (frame.url().includes('challenges.cloudflare.com')) {
+        const el = await frame.frameElement().catch(() => null);
+        if (!el) { console.log(`[frames:${tag}] frame without element`); continue; }
+        const box = await el.boundingBox().catch(() => null);
+        const style = await el.evaluate((n) => {
+          const s = window.getComputedStyle(n);
+          return { pe: s.pointerEvents, vis: s.visibility, op: s.opacity, disp: s.display };
+        }).catch(() => null);
+        console.log(`[frames:${tag}] box=${JSON.stringify(box)} style=${JSON.stringify(style)}`);
+      }
+    }
+  } catch (e) {
+    console.log(`[frames:${tag}] dump failed: ${e.message}`);
+  }
+}
+
+// 帧内点击：直接对挑战 iframe 内部的复选框元素执行 Playwright 点击，
+// 坐标由浏览器在帧内解析，绕开主页面 elementFromPoint 与外框坐标的偏差。
+async function tryInFrameClick(page) {
+  const fl = page.frameLocator('iframe[src*="challenges.cloudflare.com"]');
+  const candidates = [
+    fl.getByRole('checkbox'),
+    fl.locator('input[type="checkbox"]'),
+    fl.locator('label'),
+  ];
+  for (const loc of candidates) {
+    try {
+      const first = loc.first();
+      if ((await first.count().catch(() => 0)) > 0) {
+        await first.click({ timeout: 6000 });
+        console.log('[turnstile] in-frame element click performed');
+        return true;
+      }
+    } catch (e) {
+      console.log(`[turnstile] in-frame click candidate failed: ${String(e.message).slice(0, 120)}`);
+    }
+  }
+  return false;
+}
+
+// 在点击坐标处画一个红色标记点并截图（诊断点击到底落在哪）
+async function markClickPoint(page, x, y, name) {
+  await page.evaluate(({ x, y }) => {
+    const d = document.createElement('div');
+    d.id = '__click_marker';
+    d.style.cssText = `position:fixed;left:${x - 9}px;top:${y - 9}px;width:18px;height:18px;border:3px solid red;border-radius:50%;z-index:2147483647;pointer-events:none;background:rgba(255,0,0,0.25)`;
+    document.body.appendChild(d);
+  }, { x, y }).catch(() => {});
+  await takeScreenshot(page, name);
+  await page.evaluate(() => document.getElementById('__click_marker')?.remove()).catch(() => {});
+}
+
 // Turnstile 求解：被动等待 → 组件卡死刷新 → iframe 外框坐标拟人点击。
 // 点击点位于组件左侧约 26px 的复选框中心（实测结构），点前先做遮挡检测，
 // 点后若组件明确判失败则刷新页面换一个全新挑战，而不是反复点击旧挑战。
@@ -321,6 +377,29 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
         return true;
       }
       await sleep(2000);
+    }
+  }
+
+  // 阶段 1.5：帧内元素点击（坐标由浏览器在帧内解析，最多 2 次）
+  await dumpChallengeFrames(page, `a${attemptIndex}`);
+  for (let t = 1; t <= 2; t++) {
+    const clicked = await tryInFrameClick(page);
+    if (!clicked) break;
+    let failedSeen = false;
+    for (let i = 0; i < 15; i++) {
+      if (await checkTurnstilePassed(page)) {
+        console.log(`[turnstile] passed after in-frame click (${waitedSec()}s)`);
+        await takeScreenshot(page, `attempt${attemptIndex}-turnstile-passed`);
+        return true;
+      }
+      if (await checkTurnstileFailed(page)) { failedSeen = true; break; }
+      await sleep(2000);
+    }
+    if (failedSeen) {
+      console.log('[turnstile] in-frame click led to explicit failure, reloading for a fresh challenge...');
+      await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+      await sleep(3500);
+      await dismissAdModals(page);
     }
   }
 
@@ -379,6 +458,7 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
       console.log(`[turnstile] after neutralize, point top element: ${stillCovered || 'iframe (clear)'}`);
     }
 
+    if (clickNo === 1) await markClickPoint(page, cx, cy, `attempt${attemptIndex}-click-marker`);
     await page.mouse.move(cx - 64, cy - 28, { steps: 9 });
     await sleep(220);
     await page.mouse.move(cx, cy, { steps: 13 });
