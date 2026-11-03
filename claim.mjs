@@ -42,7 +42,7 @@ async function takeScreenshot(page, name) {
   }
 }
 
-// 模拟 ESC，清理弹窗广告
+// 模拟 ESC，清理遮挡弹窗/广告
 async function dismissAdModals(page) {
   try {
     await page.keyboard.press('Escape');
@@ -168,6 +168,7 @@ async function ensureOnClaimPage(page) {
     }
   };
 
+  // 1. 如果不在 /claim，直接导航
   if (!page.url().includes('/claim')) {
     console.log('[nav] navigating directly to /claim...');
     await page.goto(CLAIM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
@@ -175,6 +176,7 @@ async function ensureOnClaimPage(page) {
     await dismissAdModals(page);
   }
 
+  // 2. 停留在 /claim 时留出渲染时间，避免提前切走
   if (page.url().includes('/claim')) {
     for (let i = 0; i < 8; i++) {
       if (await isDirectlyReady()) {
@@ -185,6 +187,7 @@ async function ensureOnClaimPage(page) {
     }
   }
 
+  // 3. 只有明确被踢回 /servers 时，才点击侧边栏 Credits 纠偏
   if (page.url().includes('/servers')) {
     console.log('[nav] redirected to /servers, clicking sidebar Credits...');
     const creditsSidebarBtn = page.locator('a[href*="credits"], a:has-text("Credits")').first();
@@ -195,6 +198,7 @@ async function ensureOnClaimPage(page) {
     }
   }
 
+  // 4. 若停留在 /credits 汇总页，点击黄色的 Claim free credits 进入真实领取页
   if (page.url().includes('/credits') && !page.url().includes('/claim')) {
     console.log('[nav] on /credits summary, clicking "Claim free credits" button...');
     const claimEntryBtn = page.locator('button:has-text("Claim free credits"), a:has-text("Claim free credits")').first();
@@ -213,20 +217,17 @@ async function ensureOnClaimPage(page) {
   return await isDirectlyReady();
 }
 
-// 严谨校验 Turnstile 是否真正放行（杜绝 0 秒虚假通过）
+// 严谨校验 Turnstile 是否真正放行
 async function checkTurnstilePassed(page) {
   try {
     return await page.evaluate(() => {
-      // 1. 检查是否存在有效 Token
-      const input = document.querySelector('input[name="cf-turnstile-response"], input[name*="turnstile-response"]');
-      const hasToken = !!(input && input.value && input.value.length > 20);
+      const inputs = Array.from(document.querySelectorAll('input[name*="turnstile"], input[name="cf-turnstile-response"]'));
+      const hasToken = inputs.some((i) => i.value && i.value.length > 20);
 
-      // 2. 检查文本状态
-      const text = document.body.innerText;
+      const text = document.body.innerText || '';
       const isVerifiedText = text.includes('Verified, you are human') || text.includes('成功！') || text.includes('Verification Success');
       const isSecuring = text.includes('Securing your claim');
 
-      // 3. 严格核对按钮真实交互能力
       const btn = Array.from(document.querySelectorAll('button')).find((b) =>
         b.textContent.includes('Claim 3 credits')
       );
@@ -241,7 +242,6 @@ async function checkTurnstilePassed(page) {
           !btn.className.includes('opacity-50');
       }
 
-      // 必须有 Token，或者没有 Securing 且按钮完全激活
       return hasToken || isVerifiedText || (isBtnActionable && !isSecuring);
     }).catch(() => false);
   } catch {
@@ -257,54 +257,55 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
 
   await dismissAdModals(page);
 
-  // 阶段 1：静默等待放行（最多等待 35 秒）
-  for (let i = 0; i < 17; i++) {
+  // 阶段 1：静默等待放行（最多等待 30 秒）
+  for (let i = 0; i < 15; i++) {
     if (await checkTurnstilePassed(page)) {
       console.log(`[turnstile] passed passively (${waitedSec()}s)`);
       await takeScreenshot(page, `attempt${attemptIndex}-turnstile-passed`);
       return true;
     }
-    if (i % 5 === 0) console.log(`[turnstile] securing waited ${waitedSec()}s`);
     await sleep(2000);
   }
 
-  // 阶段 2：模拟点击复选框
+  // 阶段 2：模拟交互点击
   for (let clickNo = 1; clickNo <= 2; clickNo++) {
     let clicked = false;
 
-    // 优先：通过 frameLocator 直接穿透点击复选框
-    try {
-      const cfFrame = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
-      const checkbox = cfFrame.locator('input[type="checkbox"], .ctp-checkbox-label, #challenge-stage, body').first();
-      if (await checkbox.isVisible({ timeout: 2500 }).catch(() => false)) {
-        await checkbox.click({ timeout: 3500, force: true }).catch(() => {});
-        console.log(`[turnstile] checkbox clicked via frameLocator (${clickNo}/2)`);
-        clicked = true;
-      }
-    } catch {}
+    // 方式 A：优先在子 frame 内部直接操作复选框节点
+    const cfFrame = page.frames().find((f) => f.url().includes('challenges.cloudflare.com'));
+    if (cfFrame) {
+      try {
+        const stage = cfFrame.locator('input[type="checkbox"], .ctp-checkbox-label, #challenge-stage, body').first();
+        if (await stage.isVisible({ timeout: 2000 }).catch(() => false)) {
+          await stage.click({ timeout: 3000, force: true }).catch(() => {});
+          console.log(`[turnstile] clicked inside frame directly (${clickNo}/2)`);
+          clicked = true;
+        }
+      } catch {}
+    }
 
-    // 备用：计算中心物理坐标模拟点击
+    // 方式 B：计算精确物理坐标模拟真实鼠标轨迹点击
     if (!clicked) {
       const widget = await getTurnstileWidget(page);
       if (widget && widget.box) {
         const box = widget.box;
-        const cx = Math.round(box.x + 28);
+        const cx = Math.round(box.x + 30);
         const cy = Math.round(box.y + Math.min(32, box.height / 2));
 
-        await page.mouse.move(cx - 50, cy - 20, { steps: 8 });
+        await page.mouse.move(cx - 40, cy - 20, { steps: 6 });
+        await sleep(150);
+        await page.mouse.move(cx, cy, { steps: 8 });
         await sleep(200);
-        await page.mouse.move(cx, cy, { steps: 10 });
-        await sleep(250);
         await page.mouse.down();
         await sleep(100);
         await page.mouse.up();
-        console.log(`[turnstile] fallback mouse clicked (${clickNo}/2) at cx=${cx} cy=${cy}`);
+        console.log(`[turnstile] mouse clicked at cx=${cx} cy=${cy} (${clickNo}/2)`);
         clicked = true;
       }
     }
 
     if (!clicked) {
-      console.log('[turnstile] widget element not found, reloading page...');
+      console.log('[turnstile] component not ready, reloading page...');
       await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
       await sleep(3500);
       await dismissAdModals(page);
@@ -337,7 +338,7 @@ async function claimOnce(context, attemptIndex) {
     await sleep(2000);
     await dismissAdModals(page);
 
-    // 登录态校验
+    // 严谨登录校验
     const hasLogoutBtn = (await page.locator('text=/Log out/i').count()) > 0;
     const hasPasswordBox = await page.locator('input[type="password"]').first().isVisible().catch(() => false);
     const isLoginUrl = page.url().includes('/login');
