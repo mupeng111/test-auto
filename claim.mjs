@@ -42,7 +42,7 @@ async function takeScreenshot(page, name) {
   }
 }
 
-// 模拟 ESC，清理遮挡弹窗/广告
+// 模拟 ESC，清理弹窗广告
 async function dismissAdModals(page) {
   try {
     await page.keyboard.press('Escape');
@@ -51,34 +51,6 @@ async function dismissAdModals(page) {
       await closeBtn.click({ force: true, timeout: 1500 }).catch(() => {});
     }
   } catch {}
-}
-
-// 精确定位可见的 Turnstile 组件 iframe 外框
-async function getTurnstileWidget(page) {
-  for (const frame of page.frames()) {
-    if (frame.url().includes('challenges.cloudflare.com')) {
-      const frameEl = await frame.frameElement().catch(() => null);
-      if (frameEl) {
-        const box = await frameEl.boundingBox().catch(() => null);
-        if (box && box.width >= 150 && box.width <= 400 && box.height >= 40 && box.height <= 120) {
-          return { frameEl, box };
-        }
-      }
-    }
-  }
-
-  const iframes = await page.locator('iframe').all();
-  for (const iframe of iframes) {
-    const src = (await iframe.getAttribute('src').catch(() => '')) || '';
-    if (src.includes('challenges.cloudflare.com') || src.includes('turnstile')) {
-      const box = await iframe.boundingBox().catch(() => null);
-      if (box && box.width >= 150 && box.width <= 400 && box.height >= 40 && box.height <= 120) {
-        return { frameEl: iframe, box };
-      }
-    }
-  }
-
-  return null;
 }
 
 // 导出凭据：加入防毒保护，未处于登录态时绝不生成文件并清理脏文件
@@ -214,48 +186,39 @@ async function ensureOnClaimPage(page) {
 // 严谨校验 Turnstile 是否真正放行
 async function checkTurnstilePassed(page) {
   try {
-    // 1. 检查主页面是否存在生成的有效 Token
-    const hasToken = await page.evaluate(() => {
-      const inputs = Array.from(document.querySelectorAll('input[name*="turnstile"], input[name="cf-turnstile-response"]'));
-      return inputs.some((i) => i.value && i.value.length > 20);
-    }).catch(() => false);
-
-    if (hasToken) return true;
-
-    // 2. 穿透检查 Cloudflare iframe 内部状态
-    const cfFrame = page.frames().find((f) => f.url().includes('challenges.cloudflare.com'));
-    if (cfFrame) {
-      const framePassed = await cfFrame.evaluate(() => {
-        const bodyText = document.body ? document.body.innerText : '';
-        const isSuccessText = bodyText.includes('Success') || bodyText.includes('成功') || bodyText.includes('Verified');
-        const hasCheckSvg = !!document.querySelector('svg.check, .success, [data-state="success"]');
-        return isSuccessText || hasCheckSvg;
-      }).catch(() => false);
-      if (framePassed) return true;
-    }
-
-    // 3. 检查领取按钮是否已经解除禁用并变为可用
     return await page.evaluate(() => {
+      // 1. 检查是否存在有效 Token
+      const input = document.querySelector('input[name="cf-turnstile-response"], input[name*="turnstile-response"]');
+      const hasToken = !!(input && input.value && input.value.length > 20);
+
+      // 2. 检查文本状态
+      const text = document.body.innerText || '';
+      const isVerifiedText = text.includes('Verified, you are human') || text.includes('成功！') || text.includes('Verification Success');
+      const isSecuring = text.includes('Securing your claim');
+
+      // 3. 严格核对按钮真实交互能力
       const btn = Array.from(document.querySelectorAll('button')).find((b) =>
         b.textContent.includes('Claim 3 credits')
       );
-      if (!btn) return false;
-      const isSecuring = document.body.innerText.includes('Securing your claim');
-      const style = window.getComputedStyle(btn);
-      return !btn.disabled &&
-        btn.getAttribute('aria-disabled') !== 'true' &&
-        style.pointerEvents !== 'none' &&
-        style.cursor !== 'not-allowed' &&
-        !btn.className.includes('disabled') &&
-        !btn.className.includes('opacity-50') &&
-        !isSecuring;
+      let isBtnActionable = false;
+      if (btn) {
+        const style = window.getComputedStyle(btn);
+        isBtnActionable = !btn.disabled &&
+          btn.getAttribute('aria-disabled') !== 'true' &&
+          style.pointerEvents !== 'none' &&
+          style.cursor !== 'not-allowed' &&
+          !btn.className.includes('disabled') &&
+          !btn.className.includes('opacity-50');
+      }
+
+      return hasToken || isVerifiedText || (isBtnActionable && !isSecuring);
     }).catch(() => false);
   } catch {
     return false;
   }
 }
 
-// Turnstile 真实物理轨迹点击核心
+// 穿透 Shadow DOM 的高精度 Turnstile 求解核心
 async function waitAndSolveTurnstile(page, attemptIndex) {
   console.log('[turnstile] waiting for verification...');
   const startedAt = Date.now();
@@ -263,55 +226,59 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
 
   await dismissAdModals(page);
 
-  // 阶段 1：静默等待放行（最多等待 25 秒）
-  for (let i = 0; i < 13; i++) {
+  // 阶段 1：静默等待放行（最多等待 30 秒）
+  for (let i = 0; i < 15; i++) {
     if (await checkTurnstilePassed(page)) {
       console.log(`[turnstile] passed passively (${waitedSec()}s)`);
       await takeScreenshot(page, `attempt${attemptIndex}-turnstile-passed`);
       return true;
     }
-    if (i % 4 === 0) console.log(`[turnstile] securing waited ${waitedSec()}s`);
+    if (i % 5 === 0) console.log(`[turnstile] securing waited ${waitedSec()}s`);
     await sleep(2000);
   }
 
-  // 阶段 2：定位复选框并执行真实鼠标物理交互（最多 2 次）
+  // 阶段 2：通过 frameLocator 穿透 Shadow DOM 直接提取复选框物理坐标
+  const cfFrame = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
+
   for (let clickNo = 1; clickNo <= 2; clickNo++) {
-    let widget = await getTurnstileWidget(page);
-    if (!widget) {
-      console.log('[turnstile] widget element not found, waiting for DOM...');
-      await sleep(2000);
-      widget = await getTurnstileWidget(page);
+    let clicked = false;
+
+    try {
+      // 匹配你在 DevTools 中查看到的真实元素结构：label.cb-lb 或 input[type="checkbox"]
+      const targetElement = cfFrame.locator('label.cb-lb, input[type="checkbox"], label').first();
+      await targetElement.waitFor({ state: 'attached', timeout: 5000 }).catch(() => {});
+
+      // 提取元素穿透 Shadow DOM 后的绝对屏幕坐标
+      const box = await targetElement.boundingBox().catch(() => null);
+
+      if (box) {
+        // 方块复选框通常位于 label 左侧，因此取其垂直中心偏左 14px 作为绝对靶心
+        const cx = Math.round(box.x + Math.min(14, box.width / 4));
+        const cy = Math.round(box.y + box.height / 2);
+
+        console.log(`[turnstile] resolved shadow-dom element box: x=${box.x}, y=${box.y}, w=${box.width}, h=${box.height}`);
+        console.log(`[turnstile] moving native mouse to exact checkbox cx=${cx} cy=${cy}...`);
+
+        // 模拟真人鼠标平滑轨迹移动
+        await page.mouse.move(cx - 40, cy - 20, { steps: 6 });
+        await sleep(120);
+        await page.mouse.move(cx, cy, { steps: 8 });
+        await sleep(180);
+        await page.mouse.down();
+        await sleep(80 + Math.floor(Math.random() * 50));
+        await page.mouse.up();
+        console.log(`[turnstile] native mouse clicked (${clickNo}/2) at exact center cx=${cx} cy=${cy}`);
+
+        // 同时派发一次元素级 click 双保险
+        await targetElement.click({ force: true, timeout: 2000 }).catch(() => {});
+        clicked = true;
+      }
+    } catch (err) {
+      console.log('[turnstile] shadow DOM locator error:', err.message);
     }
 
-    if (widget) {
-      await widget.frameEl.scrollIntoViewIfNeeded().catch(() => {});
-      await sleep(800);
-      // 滚动后重新获取绝对坐标，抵消页面布局抖动
-      widget = await getTurnstileWidget(page);
-    }
-
-    if (widget && widget.box) {
-      const box = widget.box;
-      // 标准 Turnstile 复选框核心：距左边界约 27px，距上边界约 32px
-      const dx = 27 + Math.round((Math.random() - 0.5) * 4);
-      const dy = 32 + Math.round((Math.random() - 0.5) * 4);
-      const cx = Math.round(box.x + dx);
-      const cy = Math.round(box.y + dy);
-
-      console.log(`[turnstile] moving mouse to checkbox cx=${cx} cy=${cy}...`);
-      // 模拟多步平滑轨迹移动
-      await page.mouse.move(cx - 50, cy - 20, { steps: 8 });
-      await sleep(150 + Math.floor(Math.random() * 80));
-      await page.mouse.move(cx, cy, { steps: 10 });
-      await sleep(200 + Math.floor(Math.random() * 100));
-
-      // 原生可信点击
-      await page.mouse.down();
-      await sleep(80 + Math.floor(Math.random() * 60));
-      await page.mouse.up();
-      console.log(`[turnstile] native checkbox clicked (${clickNo}/2) at cx=${cx} cy=${cy}`);
-    } else {
-      console.log('[turnstile] widget bounding box unavailable, attempting page reload...');
+    if (!clicked) {
+      console.log('[turnstile] target element not ready, reloading page...');
       await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
       await sleep(3500);
       await dismissAdModals(page);
@@ -319,8 +286,8 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
 
     await sleep(1000);
 
-    // 点后等待放行响应（最多等待 20 秒）
-    for (let i = 0; i < 10; i++) {
+    // 点后等待放行（最多等待 24 秒）
+    for (let i = 0; i < 12; i++) {
       if (await checkTurnstilePassed(page)) {
         console.log(`[turnstile] passed after click (${waitedSec()}s)`);
         await takeScreenshot(page, `attempt${attemptIndex}-turnstile-passed`);
@@ -384,7 +351,7 @@ async function claimOnce(context, attemptIndex) {
     // 执行验证码求解
     await waitAndSolveTurnstile(page, attemptIndex);
 
-    // 等待按钮解锁
+    // 严谨等待按钮就绪
     const isEnabled = await page.waitForFunction(() => {
       const isSecuring = document.body.innerText.includes('Securing your claim');
       const btn = Array.from(document.querySelectorAll('button')).find((b) =>
