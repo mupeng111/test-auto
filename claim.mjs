@@ -83,9 +83,21 @@ async function getTurnstileWidget(page) {
   return null;
 }
 
-// 导出并清洗登录凭据
-async function exportFreshState(context) {
+// 导出凭据：加入【防毒锁】，未登录时绝对不写文件并销毁脏数据
+async function exportFreshState(context, page) {
   try {
+    // 检查页面真实登录状态，防止把失效状态写回 Secret
+    if (page) {
+      const hasLogout = (await page.locator('text=/Log out/i').count().catch(() => 0)) > 0;
+      const isLoginUrl = page.url().includes('/login');
+      if (!hasLogout || isLoginUrl) {
+        console.log('[auth] abort export: page is not in a valid logged-in session');
+        if (fs.existsSync('fresh-cookies.json')) fs.unlinkSync('fresh-cookies.json');
+        if (fs.existsSync('fresh-localstorage.json')) fs.unlinkSync('fresh-localstorage.json');
+        return false;
+      }
+    }
+
     const mappedAll = (await context.cookies()).map((c) => ({
       name: c.name,
       value: c.value,
@@ -109,8 +121,6 @@ async function exportFreshState(context) {
     };
 
     const freshCookies = mappedAll.filter(keepCookie);
-    const cookiesJson = JSON.stringify(freshCookies);
-    fs.writeFileSync('fresh-cookies.json', cookiesJson);
 
     const state = await context.storageState();
     const axentOrigin = (state.origins || []).find((o) => o.origin === 'https://app.axenthost.com');
@@ -130,10 +140,15 @@ async function exportFreshState(context) {
       }
     }
 
+    // 只有包含核心 auth 时才允许生成文件
     if (freshStorage['auth']) {
+      const cookiesJson = JSON.stringify(freshCookies);
+      fs.writeFileSync('fresh-cookies.json', cookiesJson);
+
       const storageJsonRaw = JSON.stringify(freshStorage);
       const storageJsonPacked = packSecretValue(storageJsonRaw);
       fs.writeFileSync('fresh-localstorage.json', storageJsonPacked.value);
+      console.log(`[auth] fresh session state saved (storage: ${storageJsonPacked.bytes} bytes, cookies: ${Buffer.byteLength(cookiesJson)} bytes)`);
       return true;
     }
   } catch (e) {
@@ -142,7 +157,7 @@ async function exportFreshState(context) {
   return false;
 }
 
-// 精确路由导航：在 /claim 时耐心等待组件渲染，杜绝跳出
+// 确保页面停留在真实的领取页
 async function ensureOnClaimPage(page) {
   const isDirectlyReady = async () => {
     try {
@@ -155,7 +170,7 @@ async function ensureOnClaimPage(page) {
     }
   };
 
-  // 1. 如果不在 /claim，先导航至 /claim
+  // 1. 直达 /claim
   if (!page.url().includes('/claim')) {
     console.log('[nav] navigating directly to /claim...');
     await page.goto(CLAIM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
@@ -163,7 +178,7 @@ async function ensureOnClaimPage(page) {
     await dismissAdModals(page);
   }
 
-  // 2. 只要当前 URL 已经处于 /claim，循环等待 SPA 挂载完成，绝不乱点侧边栏
+  // 2. 停留在 /claim 时留出充足渲染时间，绝不乱切侧边栏
   if (page.url().includes('/claim')) {
     for (let i = 0; i < 8; i++) {
       if (await isDirectlyReady()) {
@@ -174,7 +189,7 @@ async function ensureOnClaimPage(page) {
     }
   }
 
-  // 3. 只有当被前端路由强制重定向到了 /servers，才点击侧边栏 Credits 纠偏
+  // 3. 只有明确被踢回 /servers 时，才点击侧边栏 Credits 纠偏
   if (page.url().includes('/servers')) {
     console.log('[nav] redirected to /servers, clicking sidebar Credits...');
     const creditsSidebarBtn = page.locator('a[href*="credits"], a:has-text("Credits")').first();
@@ -185,7 +200,7 @@ async function ensureOnClaimPage(page) {
     }
   }
 
-  // 4. 若停留在 /credits 汇总页，点击黄色的 "Claim free credits" 进入真实领取页
+  // 4. 若进入 /credits 汇总页，点击黄色的 Claim free credits 按钮
   if (page.url().includes('/credits') && !page.url().includes('/claim')) {
     console.log('[nav] on /credits summary, clicking "Claim free credits" button...');
     const claimEntryBtn = page.locator('button:has-text("Claim free credits"), a:has-text("Claim free credits")').first();
@@ -194,12 +209,6 @@ async function ensureOnClaimPage(page) {
       await sleep(4000);
       await dismissAdModals(page);
     }
-  }
-
-  // 5. 最终验证是否已经就绪
-  for (let i = 0; i < 5; i++) {
-    if (await isDirectlyReady()) return true;
-    await sleep(1000);
   }
 
   return await isDirectlyReady();
@@ -240,7 +249,7 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
 
   await dismissAdModals(page);
 
-  // 阶段 1：放宽静默等待至 50 秒
+  // 阶段 1：放宽被动静默等待至 50 秒
   for (let i = 0; i < 25; i++) {
     if (await checkPassed()) {
       console.log(`[turnstile] passed without click, securing waited ${waitedSec()}s`);
@@ -251,7 +260,7 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
     await sleep(2000);
   }
 
-  // 阶段 2：查找复选框并模拟人类鼠标轨迹点击
+  // 阶段 2：模拟人类鼠标轨迹点击复选框
   for (let clickNo = 1; clickNo <= 2; clickNo++) {
     let widget = await getTurnstileWidget(page);
     if (!widget) {
@@ -302,7 +311,7 @@ async function claimOnce(context, attemptIndex) {
     await sleep(2000);
     await dismissAdModals(page);
 
-    // 严谨登录校验：有 Log out 视为已登录
+    // 严谨登录校验
     const hasLogoutBtn = (await page.locator('text=/Log out/i').count()) > 0;
     const hasPasswordBox = await page.locator('input[type="password"]').first().isVisible().catch(() => false);
     const isLoginUrl = page.url().includes('/login');
@@ -312,8 +321,8 @@ async function claimOnce(context, attemptIndex) {
       return { ok: false, reason: 'cookies-expired-or-not-logged-in' };
     }
 
-    // 登录正常，持久化最新凭据
-    await exportFreshState(context);
+    // 确认为已登录状态，安全导出最新凭据
+    await exportFreshState(context, page);
 
     // 读取可用状态与冷却时间
     const availability = await page.evaluate(() => {
@@ -339,7 +348,7 @@ async function claimOnce(context, attemptIndex) {
       return { ok: true, reason: 'cooldown-or-already-claimed', cooldown: availability.refill || undefined, remaining: availability.remaining };
     }
 
-    // 求解 Turnstile
+    // 处理 Turnstile
     await waitAndSolveTurnstile(page, attemptIndex);
 
     // 等待按钮解锁
@@ -373,7 +382,7 @@ async function claimOnce(context, attemptIndex) {
     const claimedOnce = (remainingAfter !== null && availability.remaining !== null && remainingAfter < availability.remaining) || /success|\+3/i.test(resultText);
     if (claimedOnce || (availability.remaining === null && !!afterRefill)) {
       const bal = resultText.match(/(\d+)\s*credits?/i);
-      await exportFreshState(context);
+      await exportFreshState(context, page);
       return {
         ok: true,
         balance: bal ? bal[1] : 'updated',
@@ -524,8 +533,6 @@ async function claimOnce(context, attemptIndex) {
   }
 
   console.log(`[claim] total claimed this run: ${claimedCount}`);
-
-  await exportFreshState(context);
 
   await browser.close();
   console.log('FINAL:', JSON.stringify(result));
