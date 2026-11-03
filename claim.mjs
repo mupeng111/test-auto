@@ -42,7 +42,8 @@ async function takeScreenshot(page, name) {
   }
 }
 
-// 模拟 ESC，清理弹窗广告
+// 模拟 ESC，清理弹窗广告（领取页实测有固定广告横幅会盖住 Turnstile 组件，
+// 需一并尝试关闭带关闭按钮的广告容器）
 async function dismissAdModals(page) {
   try {
     await page.keyboard.press('Escape');
@@ -50,7 +51,49 @@ async function dismissAdModals(page) {
     if (await closeBtn.isVisible().catch(() => false)) {
       await closeBtn.click({ force: true, timeout: 1500 }).catch(() => {});
     }
+    await page.evaluate(() => {
+      const all = Array.from(document.querySelectorAll('body *'));
+      for (const el of all) {
+        const s = window.getComputedStyle(el);
+        if ((s.position === 'fixed' || s.position === 'sticky') && parseInt(s.zIndex || '0', 10) >= 100) {
+          const hasAdFrame = !!el.querySelector('iframe[src*="google"], iframe[id*="google_ads"], iframe[src*="ads"], iframe[src*="doubleclick"]');
+          if (hasAdFrame) {
+            const c = el.querySelector('[aria-label*="close" i], button[class*="close" i], [class*="close-btn" i]');
+            if (c) c.click();
+          }
+        }
+      }
+    }).catch(() => {});
   } catch {}
+}
+
+// 定位可见的 Turnstile 组件（沿用实证有效的 iframe 外框定位法：
+// 通过 frameElement 拿到组件在主页面中的真实外框与坐标）
+async function getTurnstileWidget(page) {
+  for (const frame of page.frames()) {
+    if (frame.url().includes('challenges.cloudflare.com')) {
+      const frameEl = await frame.frameElement().catch(() => null);
+      if (frameEl) {
+        const box = await frameEl.boundingBox().catch(() => null);
+        if (box && box.width >= 200 && box.width <= 380 && box.height >= 40 && box.height <= 90) {
+          return { frameEl, box };
+        }
+      }
+    }
+  }
+
+  const iframes = await page.locator('iframe').all();
+  for (const iframe of iframes) {
+    const srcAttr = (await iframe.getAttribute('src').catch(() => '')) || '';
+    if (srcAttr.includes('challenges.cloudflare.com') || srcAttr.includes('turnstile')) {
+      const box = await iframe.boundingBox().catch(() => null);
+      if (box && box.width >= 200 && box.width <= 380 && box.height >= 40 && box.height <= 90) {
+        return { frameEl: iframe, box };
+      }
+    }
+  }
+
+  return null;
 }
 
 // 导出凭据：加入防毒保护，未处于登录态时绝不生成文件并清理脏文件
@@ -183,20 +226,19 @@ async function ensureOnClaimPage(page) {
   return await isDirectlyReady();
 }
 
-// 严谨校验 Turnstile 是否真正放行
+// 校验 Turnstile 是否真正放行：主页面 token/按钮状态为主判据，
+// 并穿透检查挑战 iframe 内部的成功文本（成功提示渲染在跨域 iframe 内，
+// 只看主页面 innerText 永远读不到）
 async function checkTurnstilePassed(page) {
   try {
-    return await page.evaluate(() => {
-      // 1. 检查是否存在有效 Token
+    const main = await page.evaluate(() => {
       const input = document.querySelector('input[name="cf-turnstile-response"], input[name*="turnstile-response"]');
       const hasToken = !!(input && input.value && input.value.length > 20);
 
-      // 2. 检查文本状态
       const text = document.body.innerText || '';
       const isVerifiedText = text.includes('Verified, you are human') || text.includes('成功！') || text.includes('Verification Success');
       const isSecuring = text.includes('Securing your claim');
 
-      // 3. 严格核对按钮真实交互能力
       const btn = Array.from(document.querySelectorAll('button')).find((b) =>
         b.textContent.includes('Claim 3 credits')
       );
@@ -213,21 +255,49 @@ async function checkTurnstilePassed(page) {
 
       return hasToken || isVerifiedText || (isBtnActionable && !isSecuring);
     }).catch(() => false);
+    if (main) return true;
+
+    const cfFrame = page.frames().find((f) => f.url().includes('challenges.cloudflare.com'));
+    if (cfFrame) {
+      const inFrame = await cfFrame.evaluate(() => {
+        const t = document.body ? document.body.innerText : '';
+        return t.includes('Success') || t.includes('成功') || t.includes('Verified');
+      }).catch(() => false);
+      if (inFrame) return true;
+    }
+    return false;
   } catch {
     return false;
   }
 }
 
-// 穿透 Shadow DOM 的高精度 Turnstile 求解核心
+// 检测 Turnstile 是否已明确判定失败（组件会显示 Verification failed 并重置，
+// 读到失败就立刻换新挑战，不要在已判死的挑战上继续等满超时）
+async function checkTurnstileFailed(page) {
+  try {
+    const cfFrame = page.frames().find((f) => f.url().includes('challenges.cloudflare.com'));
+    if (!cfFrame) return false;
+    return await cfFrame.evaluate(() => {
+      const t = document.body ? document.body.innerText : '';
+      return /verification failed|验证失败|驗證失敗/i.test(t);
+    }).catch(() => false);
+  } catch {
+    return false;
+  }
+}
+
+// Turnstile 求解：被动等待 → 组件卡死刷新 → iframe 外框坐标拟人点击。
+// 点击点位于组件左侧约 26px 的复选框中心（实测结构），点前先做遮挡检测，
+// 点后若组件明确判失败则刷新页面换一个全新挑战，而不是反复点击旧挑战。
 async function waitAndSolveTurnstile(page, attemptIndex) {
-  console.log('[turnstile] waiting for verification...');
+  console.log('[turnstile] waiting for verification (passive first)...');
   const startedAt = Date.now();
   const waitedSec = () => Math.round((Date.now() - startedAt) / 1000);
 
   await dismissAdModals(page);
 
-  // 阶段 1：静默等待放行（最多等待 30 秒）
-  for (let i = 0; i < 15; i++) {
+  // 阶段 1：静默等待自动放行（最多 46 秒）
+  for (let i = 0; i < 23; i++) {
     if (await checkTurnstilePassed(page)) {
       console.log(`[turnstile] passed passively (${waitedSec()}s)`);
       await takeScreenshot(page, `attempt${attemptIndex}-turnstile-passed`);
@@ -237,63 +307,102 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
     await sleep(2000);
   }
 
-  // 阶段 2：通过 frameLocator 穿透 Shadow DOM 直接提取复选框物理坐标
-  const cfFrame = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
-
-  for (let clickNo = 1; clickNo <= 2; clickNo++) {
-    let clicked = false;
-
-    try {
-      // 匹配你在 DevTools 中查看到的真实元素结构：label.cb-lb 或 input[type="checkbox"]
-      const targetElement = cfFrame.locator('label.cb-lb, input[type="checkbox"], label').first();
-      await targetElement.waitFor({ state: 'attached', timeout: 5000 }).catch(() => {});
-
-      // 提取元素穿透 Shadow DOM 后的绝对屏幕坐标
-      const box = await targetElement.boundingBox().catch(() => null);
-
-      if (box) {
-        // 方块复选框通常位于 label 左侧，因此取其垂直中心偏左 14px 作为绝对靶心
-        const cx = Math.round(box.x + Math.min(14, box.width / 4));
-        const cy = Math.round(box.y + box.height / 2);
-
-        console.log(`[turnstile] resolved shadow-dom element box: x=${box.x}, y=${box.y}, w=${box.width}, h=${box.height}`);
-        console.log(`[turnstile] moving native mouse to exact checkbox cx=${cx} cy=${cy}...`);
-
-        // 模拟真人鼠标平滑轨迹移动
-        await page.mouse.move(cx - 40, cy - 20, { steps: 6 });
-        await sleep(120);
-        await page.mouse.move(cx, cy, { steps: 8 });
-        await sleep(180);
-        await page.mouse.down();
-        await sleep(80 + Math.floor(Math.random() * 50));
-        await page.mouse.up();
-        console.log(`[turnstile] native mouse clicked (${clickNo}/2) at exact center cx=${cx} cy=${cy}`);
-
-        // 同时派发一次元素级 click 双保险
-        await targetElement.click({ force: true, timeout: 2000 }).catch(() => {});
-        clicked = true;
+  // 组件缺失或卡死：刷新一次重置挑战环境
+  let widget = await getTurnstileWidget(page);
+  if (!widget) {
+    console.log('[turnstile] component stalled, reloading page to refresh challenge...');
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+    await sleep(3500);
+    await dismissAdModals(page);
+    for (let i = 0; i < 8; i++) {
+      if (await checkTurnstilePassed(page)) {
+        console.log(`[turnstile] passed after reload (${waitedSec()}s)`);
+        await takeScreenshot(page, `attempt${attemptIndex}-turnstile-passed`);
+        return true;
       }
-    } catch (err) {
-      console.log('[turnstile] shadow DOM locator error:', err.message);
+      await sleep(2000);
     }
+  }
 
-    if (!clicked) {
-      console.log('[turnstile] target element not ready, reloading page...');
-      await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
-      await sleep(3500);
+  // 阶段 2：坐标拟人点击（最多 3 次）
+  for (let clickNo = 1; clickNo <= 3; clickNo++) {
+    widget = await getTurnstileWidget(page);
+    if (!widget) {
+      console.log('[turnstile] checkbox not visible');
+      break;
+    }
+    try { await widget.frameEl.scrollIntoViewIfNeeded(); } catch {}
+    await sleep(800);
+
+    widget = await getTurnstileWidget(page);
+    if (!widget || !widget.box) break;
+
+    const dx = 26 + Math.round(Math.random() * 6 - 3);
+    const dy = Math.round(widget.box.height / 2 + (Math.random() * 6 - 3));
+    let cx = Math.round(widget.box.x + dx);
+    let cy = Math.round(widget.box.y + dy);
+
+    // 遮挡检测：点击坐标最上层元素不是组件 iframe 时，先清理遮挡物再重新定位
+    const covered = await page.evaluate(({ el, x, y }) => {
+      const top = document.elementFromPoint(x, y);
+      return !!top && top !== el;
+    }, { el: widget.frameEl, x: cx, y: cy }).catch(() => false);
+    if (covered) {
+      console.log('[turnstile] click point covered by overlay, clearing...');
       await dismissAdModals(page);
+      await page.evaluate(({ x, y }) => {
+        const top = document.elementFromPoint(x, y);
+        if (top && top.tagName !== 'IFRAME') {
+          let n = top;
+          for (let i = 0; i < 4 && n; i++) {
+            const s = window.getComputedStyle(n);
+            if (s.position === 'fixed' || s.position === 'sticky') { n.style.display = 'none'; break; }
+            n = n.parentElement;
+          }
+        }
+      }, { x: cx, y: cy }).catch(() => {});
+      await sleep(600);
+      widget = await getTurnstileWidget(page);
+      if (!widget || !widget.box) break;
+      cx = Math.round(widget.box.x + dx);
+      cy = Math.round(widget.box.y + Math.round(widget.box.height / 2));
     }
 
-    await sleep(1000);
+    await page.mouse.move(cx - 64, cy - 28, { steps: 9 });
+    await sleep(220);
+    await page.mouse.move(cx, cy, { steps: 13 });
+    await sleep(300 + Math.floor(Math.random() * 300));
+    await page.mouse.down();
+    await sleep(80 + Math.floor(Math.random() * 80));
+    await page.mouse.up();
+    console.log(`[turnstile] checkbox clicked (${clickNo}/3) at dx=${dx} dy=${dy}`);
+    await sleep(500);
 
-    // 点后等待放行（最多等待 24 秒）
-    for (let i = 0; i < 12; i++) {
+    let failedSeen = false;
+    for (let i = 0; i < 15; i++) {
       if (await checkTurnstilePassed(page)) {
         console.log(`[turnstile] passed after click (${waitedSec()}s)`);
         await takeScreenshot(page, `attempt${attemptIndex}-turnstile-passed`);
         return true;
       }
+      if (await checkTurnstileFailed(page)) { failedSeen = true; break; }
       await sleep(2000);
+    }
+
+    if (failedSeen) {
+      console.log('[turnstile] verification failed explicitly, reloading for a fresh challenge...');
+      await sleep(4000 + Math.floor(Math.random() * 3000));
+      await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+      await sleep(3500);
+      await dismissAdModals(page);
+      for (let i = 0; i < 8; i++) {
+        if (await checkTurnstilePassed(page)) {
+          console.log(`[turnstile] passed after fresh challenge (${waitedSec()}s)`);
+          await takeScreenshot(page, `attempt${attemptIndex}-turnstile-passed`);
+          return true;
+        }
+        await sleep(2000);
+      }
     }
   }
 
@@ -411,8 +520,8 @@ async function claimOnce(context, attemptIndex) {
   }
 }
 
-// 主程序入口
-(async () => {
+// 浏览器启动（优先系统 Chrome，失败回退内置 Chromium）
+async function launchBrowser() {
   const launchOpts = {
     headless: false,
     args: [
@@ -438,7 +547,11 @@ async function claimOnce(context, attemptIndex) {
     browser = await chromium.launch(launchOpts);
   }
   console.log(`[browser] launched with ${browserKind}`);
+  return browser;
+}
 
+// 构建带指纹伪装与登录凭据注入的浏览器上下文
+async function buildContext(browser) {
   const context = await browser.newContext({
     viewport: { width: 1920, height: 1080 },
     locale: 'en-US',
@@ -492,6 +605,13 @@ async function claimOnce(context, attemptIndex) {
       console.error('[auth] failed to parse AXENT_COOKIES:', e.message);
     }
   }
+  return context;
+}
+
+// 主程序入口
+(async () => {
+  let browser = await launchBrowser();
+  let context = await buildContext(browser);
 
   const cooldownToSeconds = (value) => {
     if (!value) return null;
@@ -534,10 +654,23 @@ async function claimOnce(context, attemptIndex) {
 
     failures++;
     if (failures >= MAX_ATTEMPTS) break;
-    await sleep(7000);
+    // 验证类失败说明当前会话已被风控标记，整浏览器重启换新会话再试，
+    // 不要在同一个会话里反复撞墙
+    if (result.reason === 'button-disabled-verification-failed' || result.reason === 'unknown-result') {
+      console.log('[run] verification failed, relaunching browser with a fresh session...');
+      await browser.close().catch(() => {});
+      await sleep(5000);
+      browser = await launchBrowser();
+      context = await buildContext(browser);
+    } else {
+      await sleep(7000);
+    }
   }
 
   console.log(`[claim] total claimed this run: ${claimedCount}`);
+
+  // 收尾保底回写：只要会话里还有 auth 凭据就同步一次，避免 secret 断更
+  await exportFreshState(context, null).catch(() => {});
 
   await browser.close();
   console.log('FINAL:', JSON.stringify(result));
