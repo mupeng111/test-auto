@@ -143,9 +143,13 @@ async function exportFreshState(context) {
 // 确保页面正确抵达真实的 /claim 领取界面
 async function ensureOnClaimPage(page) {
   const isDirectlyReady = async () => {
-    const hasClaimBtn = (await page.locator('button:has-text("Claim 3 credits")').count()) > 0;
-    const hasClaimText = (await page.locator('text=/Claim 3 free credits/i').count()) > 0;
-    return hasClaimBtn || hasClaimText;
+    try {
+      const btnCount = await page.locator('button:has-text("Claim 3 credits")').count();
+      const textCount = await page.locator('text="Claim 3 free credits"').count();
+      return btnCount > 0 || textCount > 0;
+    } catch {
+      return false;
+    }
   };
 
   if (await isDirectlyReady()) return true;
@@ -160,9 +164,12 @@ async function ensureOnClaimPage(page) {
   }
 
   // 2. 如果被重定向到了 /servers，点击侧边栏的 "Credits"
-  if (page.url().includes('/servers') || (await page.locator('h1:has-text("Servers"), text=/^Servers$/i').count()) > 0) {
+  const isServersPage = page.url().includes('/servers') || 
+    (await page.locator('h1:has-text("Servers")').count().catch(() => 0)) > 0;
+
+  if (isServersPage) {
     console.log('[nav] redirected to /servers, clicking sidebar Credits...');
-    const creditsSidebarBtn = page.locator('a:has-text("Credits"), button:has-text("Credits")').first();
+    const creditsSidebarBtn = page.locator('a[href*="credits"], a:has-text("Credits")').first();
     if (await creditsSidebarBtn.isVisible().catch(() => false)) {
       await creditsSidebarBtn.click({ force: true }).catch(() => {});
       await sleep(3500);
@@ -170,8 +177,11 @@ async function ensureOnClaimPage(page) {
     }
   }
 
-  // 3. 如果停留在 /credits 汇总页，点击黄色的 "Claim free credits" 按钮进入领取页
-  if (page.url().includes('/credits') || (await page.locator('button:has-text("Claim free credits")').count()) > 0) {
+  // 3. 如果停留在 /credits 汇总页，点击黄色的 "Claim free credits" 按钮进入真正的领取页
+  const isCreditsSummary = page.url().includes('/credits') || 
+    (await page.locator('button:has-text("Claim free credits")').count().catch(() => 0)) > 0;
+
+  if (isCreditsSummary) {
     console.log('[nav] on /credits summary, clicking "Claim free credits" button...');
     const claimEntryBtn = page.locator('button:has-text("Claim free credits"), a:has-text("Claim free credits")').first();
     if (await claimEntryBtn.isVisible().catch(() => false)) {
@@ -376,7 +386,6 @@ async function claimOnce(context, attemptIndex) {
     await takeScreenshot(page, `attempt${attemptIndex}-exception`);
     return { ok: false, reason: `exception: ${err.message.slice(0, 120)}` };
   } finally {
-    // 增加 3 秒超时竞争，防止 Chromium 异常时无限挂起
     try {
       await Promise.race([
         page.close({ runBeforeUnload: false }),
@@ -514,7 +523,6 @@ async function claimOnce(context, attemptIndex) {
 
   console.log(`[claim] total claimed this run: ${claimedCount}`);
 
-  // 退出前保底更新凭据
   await exportFreshState(context);
 
   await browser.close();
