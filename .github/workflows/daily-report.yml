@@ -72,3 +72,16 @@ jobs:
             -d chat_id="${TELEGRAM_CHAT_ID}" \
             --data-urlencode text="${MSG}")
           echo "Telegram response: ${RESP}"
+      - name: 自动清理历史汇报运行记录（只保留最新1条）
+            if: always()
+                  env:
+                          GH_TOKEN: ${{ secrets.GH_PAT }}
+                                run: |
+                                        keep=0
+                                                for run_id in $(gh api "repos/${{ github.repository }}/actions/workflows/daily-report.yml/runs?per_page=100" --jq '.workflow_runs[].id'); do
+                                                          keep=$((keep+1))
+                                                                    if [ "$keep" -gt 1 ]; then
+                                                                                gh api -X DELETE "repos/${{ github.repository }}/actions/runs/$run_id" || true
+                                                                                          fi
+                                                                                                  done
+                                                                                                          echo "cleanup done: kept latest 1 daily-report run"
