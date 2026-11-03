@@ -53,15 +53,14 @@ async function dismissAdModals(page) {
   } catch {}
 }
 
-// 定位可见的 Turnstile 组件外框
+// 精确定位可见的 Turnstile 组件 iframe 外框
 async function getTurnstileWidget(page) {
   for (const frame of page.frames()) {
     if (frame.url().includes('challenges.cloudflare.com')) {
       const frameEl = await frame.frameElement().catch(() => null);
       if (frameEl) {
-        await frameEl.scrollIntoViewIfNeeded().catch(() => {});
         const box = await frameEl.boundingBox().catch(() => null);
-        if (box && box.width > 50 && box.height > 20) {
+        if (box && box.width >= 150 && box.width <= 400 && box.height >= 40 && box.height <= 120) {
           return { frameEl, box };
         }
       }
@@ -72,9 +71,8 @@ async function getTurnstileWidget(page) {
   for (const iframe of iframes) {
     const src = (await iframe.getAttribute('src').catch(() => '')) || '';
     if (src.includes('challenges.cloudflare.com') || src.includes('turnstile')) {
-      await iframe.scrollIntoViewIfNeeded().catch(() => {});
       const box = await iframe.boundingBox().catch(() => null);
-      if (box && box.width > 50 && box.height > 20) {
+      if (box && box.width >= 150 && box.width <= 400 && box.height >= 40 && box.height <= 120) {
         return { frameEl: iframe, box };
       }
     }
@@ -168,7 +166,6 @@ async function ensureOnClaimPage(page) {
     }
   };
 
-  // 1. 如果不在 /claim，直接导航
   if (!page.url().includes('/claim')) {
     console.log('[nav] navigating directly to /claim...');
     await page.goto(CLAIM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
@@ -176,7 +173,6 @@ async function ensureOnClaimPage(page) {
     await dismissAdModals(page);
   }
 
-  // 2. 停留在 /claim 时留出渲染时间，避免提前切走
   if (page.url().includes('/claim')) {
     for (let i = 0; i < 8; i++) {
       if (await isDirectlyReady()) {
@@ -187,7 +183,6 @@ async function ensureOnClaimPage(page) {
     }
   }
 
-  // 3. 只有明确被踢回 /servers 时，才点击侧边栏 Credits 纠偏
   if (page.url().includes('/servers')) {
     console.log('[nav] redirected to /servers, clicking sidebar Credits...');
     const creditsSidebarBtn = page.locator('a[href*="credits"], a:has-text("Credits")').first();
@@ -198,7 +193,6 @@ async function ensureOnClaimPage(page) {
     }
   }
 
-  // 4. 若停留在 /credits 汇总页，点击黄色的 Claim free credits 进入真实领取页
   if (page.url().includes('/credits') && !page.url().includes('/claim')) {
     console.log('[nav] on /credits summary, clicking "Claim free credits" button...');
     const claimEntryBtn = page.locator('button:has-text("Claim free credits"), a:has-text("Claim free credits")').first();
@@ -220,36 +214,48 @@ async function ensureOnClaimPage(page) {
 // 严谨校验 Turnstile 是否真正放行
 async function checkTurnstilePassed(page) {
   try {
-    return await page.evaluate(() => {
+    // 1. 检查主页面是否存在生成的有效 Token
+    const hasToken = await page.evaluate(() => {
       const inputs = Array.from(document.querySelectorAll('input[name*="turnstile"], input[name="cf-turnstile-response"]'));
-      const hasToken = inputs.some((i) => i.value && i.value.length > 20);
+      return inputs.some((i) => i.value && i.value.length > 20);
+    }).catch(() => false);
 
-      const text = document.body.innerText || '';
-      const isVerifiedText = text.includes('Verified, you are human') || text.includes('成功！') || text.includes('Verification Success');
-      const isSecuring = text.includes('Securing your claim');
+    if (hasToken) return true;
 
+    // 2. 穿透检查 Cloudflare iframe 内部状态
+    const cfFrame = page.frames().find((f) => f.url().includes('challenges.cloudflare.com'));
+    if (cfFrame) {
+      const framePassed = await cfFrame.evaluate(() => {
+        const bodyText = document.body ? document.body.innerText : '';
+        const isSuccessText = bodyText.includes('Success') || bodyText.includes('成功') || bodyText.includes('Verified');
+        const hasCheckSvg = !!document.querySelector('svg.check, .success, [data-state="success"]');
+        return isSuccessText || hasCheckSvg;
+      }).catch(() => false);
+      if (framePassed) return true;
+    }
+
+    // 3. 检查领取按钮是否已经解除禁用并变为可用
+    return await page.evaluate(() => {
       const btn = Array.from(document.querySelectorAll('button')).find((b) =>
         b.textContent.includes('Claim 3 credits')
       );
-      let isBtnActionable = false;
-      if (btn) {
-        const style = window.getComputedStyle(btn);
-        isBtnActionable = !btn.disabled &&
-          btn.getAttribute('aria-disabled') !== 'true' &&
-          style.pointerEvents !== 'none' &&
-          style.cursor !== 'not-allowed' &&
-          !btn.className.includes('disabled') &&
-          !btn.className.includes('opacity-50');
-      }
-
-      return hasToken || isVerifiedText || (isBtnActionable && !isSecuring);
+      if (!btn) return false;
+      const isSecuring = document.body.innerText.includes('Securing your claim');
+      const style = window.getComputedStyle(btn);
+      return !btn.disabled &&
+        btn.getAttribute('aria-disabled') !== 'true' &&
+        style.pointerEvents !== 'none' &&
+        style.cursor !== 'not-allowed' &&
+        !btn.className.includes('disabled') &&
+        !btn.className.includes('opacity-50') &&
+        !isSecuring;
     }).catch(() => false);
   } catch {
     return false;
   }
 }
 
-// Turnstile 求解与自愈流程
+// Turnstile 真实物理轨迹点击核心
 async function waitAndSolveTurnstile(page, attemptIndex) {
   console.log('[turnstile] waiting for verification...');
   const startedAt = Date.now();
@@ -257,55 +263,55 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
 
   await dismissAdModals(page);
 
-  // 阶段 1：静默等待放行（最多等待 30 秒）
-  for (let i = 0; i < 15; i++) {
+  // 阶段 1：静默等待放行（最多等待 25 秒）
+  for (let i = 0; i < 13; i++) {
     if (await checkTurnstilePassed(page)) {
       console.log(`[turnstile] passed passively (${waitedSec()}s)`);
       await takeScreenshot(page, `attempt${attemptIndex}-turnstile-passed`);
       return true;
     }
+    if (i % 4 === 0) console.log(`[turnstile] securing waited ${waitedSec()}s`);
     await sleep(2000);
   }
 
-  // 阶段 2：模拟交互点击
+  // 阶段 2：定位复选框并执行真实鼠标物理交互（最多 2 次）
   for (let clickNo = 1; clickNo <= 2; clickNo++) {
-    let clicked = false;
-
-    // 方式 A：优先在子 frame 内部直接操作复选框节点
-    const cfFrame = page.frames().find((f) => f.url().includes('challenges.cloudflare.com'));
-    if (cfFrame) {
-      try {
-        const stage = cfFrame.locator('input[type="checkbox"], .ctp-checkbox-label, #challenge-stage, body').first();
-        if (await stage.isVisible({ timeout: 2000 }).catch(() => false)) {
-          await stage.click({ timeout: 3000, force: true }).catch(() => {});
-          console.log(`[turnstile] clicked inside frame directly (${clickNo}/2)`);
-          clicked = true;
-        }
-      } catch {}
+    let widget = await getTurnstileWidget(page);
+    if (!widget) {
+      console.log('[turnstile] widget element not found, waiting for DOM...');
+      await sleep(2000);
+      widget = await getTurnstileWidget(page);
     }
 
-    // 方式 B：计算精确物理坐标模拟真实鼠标轨迹点击
-    if (!clicked) {
-      const widget = await getTurnstileWidget(page);
-      if (widget && widget.box) {
-        const box = widget.box;
-        const cx = Math.round(box.x + 30);
-        const cy = Math.round(box.y + Math.min(32, box.height / 2));
-
-        await page.mouse.move(cx - 40, cy - 20, { steps: 6 });
-        await sleep(150);
-        await page.mouse.move(cx, cy, { steps: 8 });
-        await sleep(200);
-        await page.mouse.down();
-        await sleep(100);
-        await page.mouse.up();
-        console.log(`[turnstile] mouse clicked at cx=${cx} cy=${cy} (${clickNo}/2)`);
-        clicked = true;
-      }
+    if (widget) {
+      await widget.frameEl.scrollIntoViewIfNeeded().catch(() => {});
+      await sleep(800);
+      // 滚动后重新获取绝对坐标，抵消页面布局抖动
+      widget = await getTurnstileWidget(page);
     }
 
-    if (!clicked) {
-      console.log('[turnstile] component not ready, reloading page...');
+    if (widget && widget.box) {
+      const box = widget.box;
+      // 标准 Turnstile 复选框核心：距左边界约 27px，距上边界约 32px
+      const dx = 27 + Math.round((Math.random() - 0.5) * 4);
+      const dy = 32 + Math.round((Math.random() - 0.5) * 4);
+      const cx = Math.round(box.x + dx);
+      const cy = Math.round(box.y + dy);
+
+      console.log(`[turnstile] moving mouse to checkbox cx=${cx} cy=${cy}...`);
+      // 模拟多步平滑轨迹移动
+      await page.mouse.move(cx - 50, cy - 20, { steps: 8 });
+      await sleep(150 + Math.floor(Math.random() * 80));
+      await page.mouse.move(cx, cy, { steps: 10 });
+      await sleep(200 + Math.floor(Math.random() * 100));
+
+      // 原生可信点击
+      await page.mouse.down();
+      await sleep(80 + Math.floor(Math.random() * 60));
+      await page.mouse.up();
+      console.log(`[turnstile] native checkbox clicked (${clickNo}/2) at cx=${cx} cy=${cy}`);
+    } else {
+      console.log('[turnstile] widget bounding box unavailable, attempting page reload...');
       await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
       await sleep(3500);
       await dismissAdModals(page);
@@ -313,8 +319,8 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
 
     await sleep(1000);
 
-    // 点后等待放行（最多等待 24 秒）
-    for (let i = 0; i < 12; i++) {
+    // 点后等待放行响应（最多等待 20 秒）
+    for (let i = 0; i < 10; i++) {
       if (await checkTurnstilePassed(page)) {
         console.log(`[turnstile] passed after click (${waitedSec()}s)`);
         await takeScreenshot(page, `attempt${attemptIndex}-turnstile-passed`);
@@ -378,7 +384,7 @@ async function claimOnce(context, attemptIndex) {
     // 执行验证码求解
     await waitAndSolveTurnstile(page, attemptIndex);
 
-    // 严谨等待按钮就绪
+    // 等待按钮解锁
     const isEnabled = await page.waitForFunction(() => {
       const isSecuring = document.body.innerText.includes('Securing your claim');
       const btn = Array.from(document.querySelectorAll('button')).find((b) =>
