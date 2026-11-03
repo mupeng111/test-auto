@@ -119,17 +119,20 @@ jobs:
           path: screenshots/
           retention-days: 1
 
-      - name: 自动清理历史构建运行记录
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          for run_id in $(gh api "repos/${{ github.repository }}/actions/workflows/claim.yml/runs?per_page=100" --jq '.workflow_runs[].id'); do
-            if [ "$run_id" != "${{ github.run_id }}" ]; then
-              gh api -X DELETE "repos/${{ github.repository }}/actions/runs/$run_id" || true
-            fi
-          done
-
+            - name: 自动清理历史构建运行记录（保留最新3条）
+                if: always()
+                      env:
+                              GH_TOKEN: ${{ secrets.GH_PAT }}
+                                    run: |
+                                            keep=0
+                                                    for run_id in $(gh api "repos/${{ github.repository }}/actions/workflows/claim.yml/runs?per_page=100" --jq '.workflow_runs[].id'); do
+                                                              keep=$((keep+1))
+                                                                        if [ "$keep" -gt 3 ]; then
+                                                                                    gh api -X DELETE "repos/${{ github.repository }}/actions/runs/$run_id" || true
+                                                                                              fi
+                                                                                                      done
+          echo "cleanup done: kept latest 3 claim runs"
+          
       - name: 任务失败时发送 Telegram 告警
         if: failure()
         continue-on-error: true
