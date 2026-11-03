@@ -53,7 +53,7 @@ async function dismissAdModals(page) {
   } catch {}
 }
 
-// 定位可见的 Turnstile 组件（去除严格的像素高宽硬编码）
+// 定位可见的 Turnstile 组件
 async function getTurnstileWidget(page) {
   for (const frame of page.frames()) {
     if (frame.url().includes('challenges.cloudflare.com')) {
@@ -142,48 +142,64 @@ async function exportFreshState(context) {
   return false;
 }
 
-// 确保页面正确抵达真实的领取页
+// 精确路由导航：在 /claim 时耐心等待组件渲染，杜绝跳出
 async function ensureOnClaimPage(page) {
   const isDirectlyReady = async () => {
     try {
-      const btnCount = await page.locator('button:has-text("Claim 3 credits")').count();
-      const textCount = await page.locator('text=/Claim 3 free credits/i').count();
-      return btnCount > 0 || textCount > 0;
+      const hasClaimBtn = (await page.locator('button:has-text("Claim 3 credits")').count()) > 0;
+      const hasClaimText = (await page.locator('text=/Claim 3 free credits/i').count()) > 0;
+      const hasClaimsStatus = (await page.locator('text=/\\d+\\s*\\/\\s*5\\s*claims?/i').count()) > 0;
+      return hasClaimBtn || hasClaimText || hasClaimsStatus;
     } catch {
       return false;
     }
   };
 
-  if (await isDirectlyReady()) return true;
-
-  // 1. 直达 /claim
+  // 1. 如果不在 /claim，先导航至 /claim
   if (!page.url().includes('/claim')) {
-    console.log('[nav] navigating to /claim...');
+    console.log('[nav] navigating directly to /claim...');
     await page.goto(CLAIM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
-    await sleep(3500);
+    await sleep(2500);
     await dismissAdModals(page);
-    if (await isDirectlyReady()) return true;
   }
 
-  // 2. 若进入了 /servers 或显示加载列表，点击侧边栏 Credits
-  const hasSidebarCredits = (await page.locator('a[href*="credits"], a:has-text("Credits")').count()) > 0;
-  if (!page.url().includes('/claim') || page.url().includes('/servers') || !hasSidebarCredits) {
+  // 2. 只要当前 URL 已经处于 /claim，循环等待 SPA 挂载完成，绝不乱点侧边栏
+  if (page.url().includes('/claim')) {
+    for (let i = 0; i < 8; i++) {
+      if (await isDirectlyReady()) {
+        console.log('[nav] /claim elements loaded successfully');
+        return true;
+      }
+      await sleep(1000);
+    }
+  }
+
+  // 3. 只有当被前端路由强制重定向到了 /servers，才点击侧边栏 Credits 纠偏
+  if (page.url().includes('/servers')) {
+    console.log('[nav] redirected to /servers, clicking sidebar Credits...');
     const creditsSidebarBtn = page.locator('a[href*="credits"], a:has-text("Credits")').first();
     if (await creditsSidebarBtn.isVisible().catch(() => false)) {
-      console.log('[nav] clicking sidebar Credits...');
       await creditsSidebarBtn.click({ force: true }).catch(() => {});
+      await sleep(3500);
+      await dismissAdModals(page);
+    }
+  }
+
+  // 4. 若停留在 /credits 汇总页，点击黄色的 "Claim free credits" 进入真实领取页
+  if (page.url().includes('/credits') && !page.url().includes('/claim')) {
+    console.log('[nav] on /credits summary, clicking "Claim free credits" button...');
+    const claimEntryBtn = page.locator('button:has-text("Claim free credits"), a:has-text("Claim free credits")').first();
+    if (await claimEntryBtn.isVisible().catch(() => false)) {
+      await claimEntryBtn.click({ force: true }).catch(() => {});
       await sleep(4000);
       await dismissAdModals(page);
     }
   }
 
-  // 3. 若停留在 /credits 汇总页，点击黄色的 Claim free credits 按钮
-  const claimEntryBtn = page.locator('button:has-text("Claim free credits"), a:has-text("Claim free credits")').first();
-  if (await claimEntryBtn.isVisible().catch(() => false)) {
-    console.log('[nav] on summary page, clicking Claim free credits...');
-    await claimEntryBtn.click({ force: true }).catch(() => {});
-    await sleep(4000);
-    await dismissAdModals(page);
+  // 5. 最终验证是否已经就绪
+  for (let i = 0; i < 5; i++) {
+    if (await isDirectlyReady()) return true;
+    await sleep(1000);
   }
 
   return await isDirectlyReady();
@@ -224,7 +240,7 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
 
   await dismissAdModals(page);
 
-  // 阶段 1：放宽被动静默等待至最多 50 秒（每 2 秒检测一次，共 25 次）
+  // 阶段 1：放宽静默等待至 50 秒
   for (let i = 0; i < 25; i++) {
     if (await checkPassed()) {
       console.log(`[turnstile] passed without click, securing waited ${waitedSec()}s`);
@@ -235,7 +251,7 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
     await sleep(2000);
   }
 
-  // 阶段 2：模拟人类鼠标轨迹点击复选框
+  // 阶段 2：查找复选框并模拟人类鼠标轨迹点击
   for (let clickNo = 1; clickNo <= 2; clickNo++) {
     let widget = await getTurnstileWidget(page);
     if (!widget) {
@@ -286,7 +302,7 @@ async function claimOnce(context, attemptIndex) {
     await sleep(2000);
     await dismissAdModals(page);
 
-    // 严谨的登录态校验：只要存在 Log out 按钮，绝对视为已登录
+    // 严谨登录校验：有 Log out 视为已登录
     const hasLogoutBtn = (await page.locator('text=/Log out/i').count()) > 0;
     const hasPasswordBox = await page.locator('input[type="password"]').first().isVisible().catch(() => false);
     const isLoginUrl = page.url().includes('/login');
@@ -296,7 +312,7 @@ async function claimOnce(context, attemptIndex) {
       return { ok: false, reason: 'cookies-expired-or-not-logged-in' };
     }
 
-    // 登录正常，立刻持久化最新状态
+    // 登录正常，持久化最新凭据
     await exportFreshState(context);
 
     // 读取可用状态与冷却时间
