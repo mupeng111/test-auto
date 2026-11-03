@@ -298,7 +298,8 @@ async function dumpChallengeFrames(page, tag) {
           const s = window.getComputedStyle(n);
           return { pe: s.pointerEvents, vis: s.visibility, op: s.opacity, disp: s.display };
         }).catch(() => null);
-        console.log(`[frames:${tag}] box=${JSON.stringify(box)} style=${JSON.stringify(style)}`);
+        const txt = await frame.evaluate(() => (document.body?.innerText || '').replace(/\s+/g, ' ').slice(0, 120)).catch(() => null);
+        console.log(`[frames:${tag}] box=${JSON.stringify(box)} style=${JSON.stringify(style)} text=${JSON.stringify(txt)}`);
       }
     }
   } catch (e) {
@@ -340,6 +341,51 @@ async function markClickPoint(page, x, y, name) {
   }, { x, y }).catch(() => {});
   await takeScreenshot(page, name);
   await page.evaluate(() => document.getElementById('__click_marker')?.remove()).catch(() => {});
+}
+
+// 读挑战 iframe 内部文本（组件真实状态：未勾选 / 验证中 / 失败原因）
+async function challengeFrameText(page) {
+  for (const frame of page.frames()) {
+    if (frame.url().includes('challenges.cloudflare.com')) {
+      const t = await frame.evaluate(() => (document.body?.innerText || '').replace(/\s+/g, ' ').slice(0, 140)).catch(() => null);
+      if (t) return t;
+    }
+  }
+  return null;
+}
+
+// 关闭 Google 插页广告（vignette）：优先点它自带的 Close/dismiss 控件，其次 Esc。
+async function closeVignette(page) {
+  const selectors = [
+    '#dismiss-button',
+    '[id*="dismiss-button"]',
+    'div[aria-label="Close ad"]',
+    '[aria-label="Close ad"]',
+    '.google-ad-close',
+  ];
+  for (const sel of selectors) {
+    try {
+      const loc = page.locator(sel).first();
+      if ((await loc.count().catch(() => 0)) > 0 && await loc.isVisible().catch(() => false)) {
+        await loc.click({ timeout: 3000 });
+        console.log(`[ads] vignette closed via ${sel}`);
+        await sleep(800);
+        return true;
+      }
+    } catch {}
+  }
+  // 兜底：右上角区域的 "Close" 文本控件
+  try {
+    const loc = page.locator('text=/^Close$/').first();
+    if ((await loc.count().catch(() => 0)) > 0 && await loc.isVisible().catch(() => false)) {
+      await loc.click({ timeout: 3000 });
+      console.log('[ads] vignette closed via Close text');
+      await sleep(800);
+      return true;
+    }
+  } catch {}
+  await page.keyboard.press('Escape').catch(() => {});
+  return false;
 }
 
 // 清除全屏广告层（插页 iframe 及其遮罩容器），并检测页面是否已被广告带离站点
@@ -388,8 +434,8 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
   await sweepFullscreenAds(page);
   await ensureOnSite(page);
 
-  // 阶段 1：静默等待自动放行（最多 46 秒）
-  for (let i = 0; i < 23; i++) {
+  // 阶段 1：静默等待自动放行（缩短到 12 秒——插页广告随停留时间出现，越快进入点击越好）
+  for (let i = 0; i < 6; i++) {
     if (await checkTurnstilePassed(page)) {
       console.log(`[turnstile] passed passively (${waitedSec()}s)`);
       await takeScreenshot(page, `attempt${attemptIndex}-turnstile-passed`);
@@ -441,8 +487,10 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
     }
   }
 
-  // 阶段 2：坐标拟人点击（最多 3 次）
-  for (let clickNo = 1; clickNo <= 3; clickNo++) {
+  // 阶段 2：坐标拟人点击（最多 2 次；反复点击会重置组件的校验计时，所以点后耐心等满 60 秒）
+  for (let clickNo = 1; clickNo <= 2; clickNo++) {
+    await closeVignette(page);
+    await sweepFullscreenAds(page);
     widget = await getTurnstileWidget(page);
     if (!widget) {
       console.log('[turnstile] checkbox not visible');
@@ -511,17 +559,22 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
     await page.mouse.down();
     await sleep(80 + Math.floor(Math.random() * 80));
     await page.mouse.up();
-    console.log(`[turnstile] checkbox clicked (${clickNo}/3) at dx=${dx} dy=${dy}`);
+    console.log(`[turnstile] checkbox clicked (${clickNo}/2) at dx=${dx} dy=${dy}`);
     await sleep(500);
 
     let failedSeen = false;
-    for (let i = 0; i < 15; i++) {
+    for (let i = 0; i < 30; i++) {
       if (await checkTurnstilePassed(page)) {
         console.log(`[turnstile] passed after click (${waitedSec()}s)`);
         await takeScreenshot(page, `attempt${attemptIndex}-turnstile-passed`);
         return true;
       }
       if (await checkTurnstileFailed(page)) { failedSeen = true; break; }
+      if (i % 5 === 0) {
+        const t = await challengeFrameText(page);
+        if (t) console.log(`[turnstile] challenge state: ${t}`);
+      }
+      await sweepFullscreenAds(page);
       await sleep(2000);
     }
 
@@ -694,10 +747,8 @@ async function buildContext(browser) {
     timezoneId: 'America/New_York',
   });
 
-  // 网络级拦截广告请求：全屏插页广告（Google vignette）会随机接管页面、
-  // 吞掉验证组件的点击甚至把页面导航去广告落地页，从源头掐断。
-  await context.route(/googlesyndication|googleads|doubleclick|googleadservices|pagead2|adsbygoogle|adtrafficquality|adsafeprotected|amazon-adsystem|adnxs|rubiconproject|pubmatic|openx|smartadserver|adform|moatads|scorecardresearch/, (route) => route.abort().catch(() => {}));
-  console.log('[browser] ad network requests blocked');
+  // 注意：本站有广告拦截墙——拦截广告请求会整页替换成 Ad Blocker 提示（#743 实证），
+  // 因此绝不能在网络层拦广告；插页广告只能在页面内关闭/清扫（见 closeVignette）。
 
   await context.addInitScript(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
