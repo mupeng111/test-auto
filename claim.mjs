@@ -342,23 +342,29 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
     let cx = Math.round(widget.box.x + dx);
     let cy = Math.round(widget.box.y + dy);
 
-    // 遮挡检测：点击坐标最上层元素不是组件 iframe 时，先清理遮挡物再重新定位
-    const covered = await page.evaluate(({ el, x, y }) => {
+    // 遮挡检测：点击坐标最上层元素不是组件 iframe 时，记录遮挡者身份并清理后重新定位。
+    // 清理只改遮挡元素自身的 pointer-events/visibility，绝不 display:none 祖先，避免页面布局位移让坐标失效。
+    const coverInfo = await page.evaluate(({ el, x, y }) => {
       const top = document.elementFromPoint(x, y);
-      return !!top && top !== el;
-    }, { el: widget.frameEl, x: cx, y: cy }).catch(() => false);
-    if (covered) {
-      console.log('[turnstile] click point covered by overlay, clearing...');
+      if (!top || top === el) return null;
+      const r = top.getBoundingClientRect();
+      const s = window.getComputedStyle(top);
+      return {
+        tag: top.tagName,
+        id: (top.id || '').slice(0, 40),
+        cls: String(top.className || '').slice(0, 60),
+        rect: [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)],
+        pos: s.position, z: s.zIndex, pe: s.pointerEvents, op: s.opacity,
+      };
+    }, { el: widget.frameEl, x: cx, y: cy }).catch(() => null);
+    if (coverInfo) {
+      console.log(`[turnstile] click point covered by ${JSON.stringify(coverInfo)}, neutralizing...`);
       await dismissAdModals(page);
       await page.evaluate(({ x, y }) => {
         const top = document.elementFromPoint(x, y);
         if (top && top.tagName !== 'IFRAME') {
-          let n = top;
-          for (let i = 0; i < 4 && n; i++) {
-            const s = window.getComputedStyle(n);
-            if (s.position === 'fixed' || s.position === 'sticky') { n.style.display = 'none'; break; }
-            n = n.parentElement;
-          }
+          top.style.pointerEvents = 'none';
+          top.style.visibility = 'hidden';
         }
       }, { x: cx, y: cy }).catch(() => {});
       await sleep(600);
@@ -366,6 +372,11 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
       if (!widget || !widget.box) break;
       cx = Math.round(widget.box.x + dx);
       cy = Math.round(widget.box.y + Math.round(widget.box.height / 2));
+      const stillCovered = await page.evaluate(({ el, x, y }) => {
+        const top = document.elementFromPoint(x, y);
+        return !!top && top !== el ? top.tagName : null;
+      }, { el: widget.frameEl, x: cx, y: cy }).catch(() => null);
+      console.log(`[turnstile] after neutralize, point top element: ${stillCovered || 'iframe (clear)'}`);
     }
 
     await page.mouse.move(cx - 64, cy - 28, { steps: 9 });
