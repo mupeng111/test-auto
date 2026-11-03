@@ -342,6 +342,40 @@ async function markClickPoint(page, x, y, name) {
   await page.evaluate(() => document.getElementById('__click_marker')?.remove()).catch(() => {});
 }
 
+// 清除全屏广告层（插页 iframe 及其遮罩容器），并检测页面是否已被广告带离站点
+async function sweepFullscreenAds(page) {
+  const removed = await page.evaluate(() => {
+    let n = 0;
+    const vw = window.innerWidth, vh = window.innerHeight;
+    for (const el of Array.from(document.querySelectorAll('iframe, div'))) {
+      const r = el.getBoundingClientRect();
+      if (r.width >= vw * 0.95 && r.height >= vh * 0.95) {
+        const id = el.id || '';
+        const src = el.tagName === 'IFRAME' ? (el.getAttribute('src') || '') : '';
+        const hasAdFrame = !!el.querySelector?.('iframe[id*="google_ads"], iframe[src*="googlesyndication"], iframe[src*="doubleclick"]');
+        if (id.includes('google_ads') || src.includes('googlesyndication') || src.includes('doubleclick') || hasAdFrame) {
+          el.remove();
+          n++;
+        }
+      }
+    }
+    return n;
+  }).catch(() => 0);
+  if (removed > 0) console.log(`[ads] swept ${removed} fullscreen ad layer(s)`);
+  return removed;
+}
+
+async function ensureOnSite(page) {
+  if (!page.url().includes('axenthost.com')) {
+    console.log(`[ads] page navigated away to ${page.url().slice(0, 80)}, returning to claim page...`);
+    await page.goto(CLAIM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+    await sleep(3000);
+    await dismissAdModals(page);
+    return false;
+  }
+  return true;
+}
+
 // Turnstile 求解：被动等待 → 组件卡死刷新 → iframe 外框坐标拟人点击。
 // 点击点位于组件左侧约 26px 的复选框中心（实测结构），点前先做遮挡检测，
 // 点后若组件明确判失败则刷新页面换一个全新挑战，而不是反复点击旧挑战。
@@ -351,6 +385,8 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
   const waitedSec = () => Math.round((Date.now() - startedAt) / 1000);
 
   await dismissAdModals(page);
+  await sweepFullscreenAds(page);
+  await ensureOnSite(page);
 
   // 阶段 1：静默等待自动放行（最多 46 秒）
   for (let i = 0; i < 23; i++) {
@@ -360,6 +396,8 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
       return true;
     }
     if (i % 5 === 0) console.log(`[turnstile] securing waited ${waitedSec()}s`);
+    await sweepFullscreenAds(page);
+    if (!(await ensureOnSite(page))) break;
     await sleep(2000);
   }
 
@@ -458,6 +496,13 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
       console.log(`[turnstile] after neutralize, point top element: ${stillCovered || 'iframe (clear)'}`);
     }
 
+    await sweepFullscreenAds(page);
+    if (!(await ensureOnSite(page))) {
+      widget = await getTurnstileWidget(page);
+      if (!widget || !widget.box) break;
+      cx = Math.round(widget.box.x + dx);
+      cy = Math.round(widget.box.y + Math.round(widget.box.height / 2));
+    }
     if (clickNo === 1) await markClickPoint(page, cx, cy, `attempt${attemptIndex}-click-marker`);
     await page.mouse.move(cx - 64, cy - 28, { steps: 9 });
     await sleep(220);
@@ -648,6 +693,11 @@ async function buildContext(browser) {
     locale: 'en-US',
     timezoneId: 'America/New_York',
   });
+
+  // 网络级拦截广告请求：全屏插页广告（Google vignette）会随机接管页面、
+  // 吞掉验证组件的点击甚至把页面导航去广告落地页，从源头掐断。
+  await context.route(/googlesyndication|googleads|doubleclick|googleadservices|pagead2|adsbygoogle|adtrafficquality|adsafeprotected|amazon-adsystem|adnxs|rubiconproject|pubmatic|openx|smartadserver|adform|moatads|scorecardresearch/, (route) => route.abort().catch(() => {}));
+  console.log('[browser] ad network requests blocked');
 
   await context.addInitScript(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
