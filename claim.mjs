@@ -53,7 +53,7 @@ async function dismissAdModals(page) {
   } catch {}
 }
 
-// 定位可见的 Turnstile 组件
+// 定位可见的 Turnstile 组件外框
 async function getTurnstileWidget(page) {
   for (const frame of page.frames()) {
     if (frame.url().includes('challenges.cloudflare.com')) {
@@ -83,15 +83,14 @@ async function getTurnstileWidget(page) {
   return null;
 }
 
-// 导出凭据：加入【防毒锁】，未登录时绝对不写文件并销毁脏数据
+// 导出凭据：加入防毒保护，未处于登录态时绝不生成文件并清理脏文件
 async function exportFreshState(context, page) {
   try {
-    // 检查页面真实登录状态，防止把失效状态写回 Secret
     if (page) {
       const hasLogout = (await page.locator('text=/Log out/i').count().catch(() => 0)) > 0;
       const isLoginUrl = page.url().includes('/login');
       if (!hasLogout || isLoginUrl) {
-        console.log('[auth] abort export: page is not in a valid logged-in session');
+        console.log('[auth] abort export: session not logged in');
         if (fs.existsSync('fresh-cookies.json')) fs.unlinkSync('fresh-cookies.json');
         if (fs.existsSync('fresh-localstorage.json')) fs.unlinkSync('fresh-localstorage.json');
         return false;
@@ -140,7 +139,6 @@ async function exportFreshState(context, page) {
       }
     }
 
-    // 只有包含核心 auth 时才允许生成文件
     if (freshStorage['auth']) {
       const cookiesJson = JSON.stringify(freshCookies);
       fs.writeFileSync('fresh-cookies.json', cookiesJson);
@@ -161,16 +159,16 @@ async function exportFreshState(context, page) {
 async function ensureOnClaimPage(page) {
   const isDirectlyReady = async () => {
     try {
-      const hasClaimBtn = (await page.locator('button:has-text("Claim 3 credits")').count()) > 0;
-      const hasClaimText = (await page.locator('text=/Claim 3 free credits/i').count()) > 0;
-      const hasClaimsStatus = (await page.locator('text=/\\d+\\s*\\/\\s*5\\s*claims?/i').count()) > 0;
-      return hasClaimBtn || hasClaimText || hasClaimsStatus;
+      const btnCount = await page.locator('button:has-text("Claim 3 credits")').count();
+      const textCount = await page.locator('text=/Claim 3 free credits/i').count();
+      const statusCount = await page.locator('text=/\\d+\\s*\\/\\s*5\\s*claims?/i').count();
+      return btnCount > 0 || textCount > 0 || statusCount > 0;
     } catch {
       return false;
     }
   };
 
-  // 1. 直达 /claim
+  // 1. 如果不在 /claim，直接导航
   if (!page.url().includes('/claim')) {
     console.log('[nav] navigating directly to /claim...');
     await page.goto(CLAIM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
@@ -178,7 +176,7 @@ async function ensureOnClaimPage(page) {
     await dismissAdModals(page);
   }
 
-  // 2. 停留在 /claim 时留出充足渲染时间，绝不乱切侧边栏
+  // 2. 停留在 /claim 时留出渲染时间，避免提前切走
   if (page.url().includes('/claim')) {
     for (let i = 0; i < 8; i++) {
       if (await isDirectlyReady()) {
@@ -200,7 +198,7 @@ async function ensureOnClaimPage(page) {
     }
   }
 
-  // 4. 若进入 /credits 汇总页，点击黄色的 Claim free credits 按钮
+  // 4. 若停留在 /credits 汇总页，点击黄色的 Claim free credits 进入真实领取页
   if (page.url().includes('/credits') && !page.url().includes('/claim')) {
     console.log('[nav] on /credits summary, clicking "Claim free credits" button...');
     const claimEntryBtn = page.locator('button:has-text("Claim free credits"), a:has-text("Claim free credits")').first();
@@ -211,88 +209,104 @@ async function ensureOnClaimPage(page) {
     }
   }
 
+  for (let i = 0; i < 5; i++) {
+    if (await isDirectlyReady()) return true;
+    await sleep(1000);
+  }
+
   return await isDirectlyReady();
 }
 
-// Turnstile 求解与自愈
+// 判定是否已通过 Turnstile 验证
+async function checkTurnstilePassed(page) {
+  try {
+    const hasToken = await page.evaluate(() => {
+      const input = document.querySelector('input[name="cf-turnstile-response"], input[name*="turnstile-response"]');
+      return !!(input && input.value && input.value.length > 20);
+    }).catch(() => false);
+
+    const isBtnReady = await page.evaluate(() => {
+      const btn = Array.from(document.querySelectorAll('button')).find((b) =>
+        b.textContent.includes('Claim 3 credits')
+      );
+      return btn && !btn.disabled;
+    }).catch(() => false);
+
+    return hasToken || isBtnReady;
+  } catch {
+    return false;
+  }
+}
+
+// Turnstile 求解核心：高精度点击与防卡死自愈
 async function waitAndSolveTurnstile(page, attemptIndex) {
-  console.log('[turnstile] waiting for verification (passive first)...');
+  console.log('[turnstile] waiting for verification...');
   const startedAt = Date.now();
   const waitedSec = () => Math.round((Date.now() - startedAt) / 1000);
 
-  const checkPassed = async () => {
-    try {
-      const hasToken = await page.evaluate(() => {
-        const input = document.querySelector('input[name="cf-turnstile-response"], input[name*="turnstile-response"]');
-        return !!(input && input.value && input.value.length > 20);
-      }).catch(() => false);
-      if (hasToken) console.log('[turnstile] token seen');
-
-      const isVerifiedText = await page.evaluate(() => {
-        const text = document.body.innerText;
-        return text.includes('Verified, you are human') || text.includes('成功！') || text.includes('Verification Success');
-      }).catch(() => false);
-
-      const isBtnReady = await page.evaluate(() => {
-        const btn = Array.from(document.querySelectorAll('button')).find((b) =>
-          b.textContent.includes('Claim 3 credits')
-        );
-        const isSecuring = document.body.innerText.includes('Securing your claim');
-        return btn && !btn.disabled && !isSecuring;
-      }).catch(() => false);
-
-      return hasToken || isVerifiedText || isBtnReady;
-    } catch {
-      return false;
-    }
-  };
-
   await dismissAdModals(page);
 
-  // 阶段 1：放宽被动静默等待至 50 秒
-  for (let i = 0; i < 25; i++) {
-    if (await checkPassed()) {
-      console.log(`[turnstile] passed without click, securing waited ${waitedSec()}s`);
+  // 1. 静默等待放行（最多等待 35 秒）
+  for (let i = 0; i < 17; i++) {
+    if (await checkTurnstilePassed(page)) {
+      console.log(`[turnstile] passed passively (${waitedSec()}s)`);
       await takeScreenshot(page, `attempt${attemptIndex}-turnstile-passed`);
       return true;
     }
-    if (i % 5 === 0) console.log(`[turnstile] securing waited ${waitedSec()}s`);
     await sleep(2000);
   }
 
-  // 阶段 2：模拟人类鼠标轨迹点击复选框
+  // 2. 精准定位与模拟点击
   for (let clickNo = 1; clickNo <= 2; clickNo++) {
-    let widget = await getTurnstileWidget(page);
-    if (!widget) {
-      console.log('[turnstile] checkbox not visible, attempting reload once...');
-      await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
-      await sleep(3500);
-      await dismissAdModals(page);
-      widget = await getTurnstileWidget(page);
-      if (!widget) {
-        console.log('[turnstile] checkbox still not visible');
-        break;
+    let clicked = false;
+
+    // 优先：通过 frameLocator 直接操作复选框节点
+    try {
+      const cfFrame = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
+      const checkbox = cfFrame.locator('input[type="checkbox"], .ctp-checkbox-label, #challenge-stage, body').first();
+      if (await checkbox.isVisible({ timeout: 2500 }).catch(() => false)) {
+        await checkbox.click({ timeout: 3500, force: true }).catch(() => {});
+        console.log(`[turnstile] checkbox clicked via frameLocator (${clickNo}/2)`);
+        clicked = true;
+      }
+    } catch {}
+
+    // 备用：计算复选框中心物理坐标（标准高度下中心约在 dy ≈ 32px）
+    if (!clicked) {
+      const widget = await getTurnstileWidget(page);
+      if (widget && widget.box) {
+        const box = widget.box;
+        const cx = Math.round(box.x + 28);
+        const cy = Math.round(box.y + Math.min(32, box.height / 2));
+        
+        await page.mouse.move(cx - 50, cy - 20, { steps: 8 });
+        await sleep(200);
+        await page.mouse.move(cx, cy, { steps: 10 });
+        await sleep(250);
+        await page.mouse.down();
+        await sleep(100);
+        await page.mouse.up();
+        console.log(`[turnstile] fallback mouse clicked (${clickNo}/2) at cx=${cx} cy=${cy}`);
+        clicked = true;
       }
     }
 
-    const box = widget.box;
-    const dx = 26 + Math.round(Math.random() * 6 - 3);
-    const dy = Math.round(box.height / 2 + (Math.random() * 6 - 3));
-    const cx = Math.round(box.x + dx);
-    const cy = Math.round(box.y + dy);
+    if (!clicked) {
+      console.log('[turnstile] widget element not found, reloading page...');
+      await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+      await sleep(3500);
+      await dismissAdModals(page);
+    }
 
-    await page.mouse.move(cx - 64, cy - 28, { steps: 9 });
-    await sleep(220);
-    await page.mouse.move(cx, cy, { steps: 13 });
-    await sleep(300 + Math.floor(Math.random() * 300));
-    await page.mouse.down();
-    await sleep(80 + Math.floor(Math.random() * 80));
-    await page.mouse.up();
-    console.log(`[turnstile] checkbox clicked (${clickNo}/2) at dx=${dx} dy=${dy}`);
-    await sleep(800);
+    await sleep(1000);
 
-    for (let i = 0; i < 15; i++) {
-      if (await checkPassed()) return true;
+    // 点后等待响应（最多等待 24 秒）
+    for (let i = 0; i < 12; i++) {
+      if (await checkTurnstilePassed(page)) {
+        console.log(`[turnstile] passed after click (${waitedSec()}s)`);
+        await takeScreenshot(page, `attempt${attemptIndex}-turnstile-passed`);
+        return true;
+      }
       await sleep(2000);
     }
   }
@@ -311,7 +325,7 @@ async function claimOnce(context, attemptIndex) {
     await sleep(2000);
     await dismissAdModals(page);
 
-    // 严谨登录校验
+    // 登录态校验
     const hasLogoutBtn = (await page.locator('text=/Log out/i').count()) > 0;
     const hasPasswordBox = await page.locator('input[type="password"]').first().isVisible().catch(() => false);
     const isLoginUrl = page.url().includes('/login');
@@ -321,7 +335,7 @@ async function claimOnce(context, attemptIndex) {
       return { ok: false, reason: 'cookies-expired-or-not-logged-in' };
     }
 
-    // 确认为已登录状态，安全导出最新凭据
+    // 登录有效，安全导出最新凭据
     await exportFreshState(context, page);
 
     // 读取可用状态与冷却时间
@@ -348,16 +362,15 @@ async function claimOnce(context, attemptIndex) {
       return { ok: true, reason: 'cooldown-or-already-claimed', cooldown: availability.refill || undefined, remaining: availability.remaining };
     }
 
-    // 处理 Turnstile
+    // 执行验证码求解
     await waitAndSolveTurnstile(page, attemptIndex);
 
-    // 等待按钮解锁
+    // 等待按钮解除禁用
     const isEnabled = await page.waitForFunction(() => {
       const btn = Array.from(document.querySelectorAll('button')).find((b) =>
         b.textContent.includes('Claim 3 credits')
       );
-      const isSecuring = document.body.innerText.includes('Securing your claim');
-      return btn && !btn.disabled && !isSecuring;
+      return btn && !btn.disabled;
     }, { timeout: 15000 }).catch(() => false);
 
     if (!isEnabled) {
