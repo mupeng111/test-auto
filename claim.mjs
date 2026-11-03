@@ -447,6 +447,24 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
     await sleep(2000);
   }
 
+  // 阶段 1.2：不可见/未渲染模式耐心等待——挑战帧无文本时点击空处毫无意义，
+  // 不点击、不刷新，只静等其自动完成（最多 150 秒），避免高频交互继续抬高风控评分。
+  const frameText0 = await challengeFrameText(page);
+  if (!frameText0) {
+    console.log('[turnstile] challenge frame empty (invisible/unrendered), waiting passively up to 150s...');
+    for (let i = 0; i < 75; i++) {
+      if (await checkTurnstilePassed(page)) {
+        console.log(`[turnstile] passed during invisible wait (${waitedSec()}s)`);
+        await takeScreenshot(page, `attempt${attemptIndex}-turnstile-passed`);
+        return true;
+      }
+      if (await checkTurnstileFailed(page)) break;
+      await sweepFullscreenAds(page);
+      if (!(await ensureOnSite(page))) break;
+      await sleep(2000);
+    }
+  }
+
   // 组件缺失或卡死：刷新一次重置挑战环境
   let widget = await getTurnstileWidget(page);
   if (!widget) {
