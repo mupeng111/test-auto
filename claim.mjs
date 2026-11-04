@@ -24,6 +24,9 @@ const AXENT_COOKIES = process.env.AXENT_COOKIES || '';
 const AXENT_LOCAL_STORAGE = process.env.AXENT_LOCAL_STORAGE || '';
 const CLAIM_URL = 'https://app.axenthost.com/claim';
 const MAX_ATTEMPTS = 4;
+// v7：上一轮记录挑战是否处于“不可见”状态。#770/#771 实证：挑战帧连续 8 次
+// 全程不可见时，换新会话重跑毫无意义，只会多送 3 次挑战交互、继续抬高风控评分。
+let lastTurnstileInvisible = false;
 
 const SCREENSHOT_DIR = 'screenshots';
 if (!fs.existsSync(SCREENSHOT_DIR)) {
@@ -426,6 +429,7 @@ async function ensureOnSite(page) {
 // 点击点位于组件左侧约 26px 的复选框中心（实测结构），点前先做遮挡检测，
 // 点后若组件明确判失败则刷新页面换一个全新挑战，而不是反复点击旧挑战。
 async function waitAndSolveTurnstile(page, attemptIndex) {
+  lastTurnstileInvisible = false;
   console.log('[turnstile] waiting for verification (passive first)...');
   const startedAt = Date.now();
   const waitedSec = () => Math.round((Date.now() - startedAt) / 1000);
@@ -451,6 +455,7 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
   // 不点击、不刷新，只静等其自动完成（最多 150 秒），避免高频交互继续抬高风控评分。
   const frameText0 = await challengeFrameText(page);
   if (!frameText0) {
+    lastTurnstileInvisible = true;
     console.log('[turnstile] challenge frame empty (invisible/unrendered), waiting passively up to 150s...');
     for (let i = 0; i < 75; i++) {
       if (await checkTurnstilePassed(page)) {
@@ -684,7 +689,7 @@ async function claimOnce(context, attemptIndex) {
     if (!isEnabled) {
       console.log('[claim] button still disabled or securing');
       await takeScreenshot(page, `attempt${attemptIndex}-btn-disabled`);
-      return { ok: false, reason: 'button-disabled-verification-failed' };
+      return { ok: false, reason: 'button-disabled-verification-failed', invisibleChallenge: lastTurnstileInvisible };
     }
 
     const claim3Btn = page.locator('button:has-text("Claim 3 credits")').first();
@@ -863,6 +868,12 @@ async function buildContext(browser) {
     }
 
     failures++;
+    // 不可见挑战直接快速失败：实证表明换新会话也一样不可见，继续重跑只会
+    // 多送挑战交互、抬高风控分；等下一小时风控冷却后再由定时运行重试。
+    if (result.invisibleChallenge) {
+      console.log('[run] invisible challenge confirmed, failing fast instead of relaunching (fresh sessions do not help)');
+      break;
+    }
     if (failures >= MAX_ATTEMPTS) break;
     // 验证类失败说明当前会话已被风控标记，整浏览器重启换新会话再试，
     // 不要在同一个会话里反复撞墙
