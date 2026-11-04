@@ -82,11 +82,25 @@ function parseProxy(link) {
     }
 
     if (v.net === 'ws') {
+      // 路径里的 ?ed=N 是 WebSocket Early Data 参数，必须拆出来单独配置：
+      // 原样塞进 path 会让请求路径对不上服务端注册路径，返回 404。
+      let wsPath = v.path || '/';
+      let earlyData = 0;
+      const qIdx = wsPath.indexOf('?');
+      if (qIdx >= 0) {
+        const qs = new URLSearchParams(wsPath.slice(qIdx + 1));
+        if (qs.get('ed')) earlyData = parseInt(qs.get('ed'), 10) || 0;
+        wsPath = wsPath.slice(0, qIdx) || '/';
+      }
       outbound.transport = {
         type: 'ws',
-        path: v.path || '/',
+        path: wsPath,
         headers: v.host ? { Host: v.host } : undefined,
       };
+      if (earlyData > 0) {
+        outbound.transport.max_early_data = earlyData;
+        outbound.transport.early_data_header_name = 'Sec-WebSocket-Protocol';
+      }
     }
     return outbound;
   }
