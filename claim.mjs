@@ -24,7 +24,11 @@ const PROXY_SERVER = process.env.PROXY_SERVER || '';
 const AXENT_COOKIES = process.env.AXENT_COOKIES || '';
 const AXENT_LOCAL_STORAGE = process.env.AXENT_LOCAL_STORAGE || '';
 const CLAIM_URL = 'https://app.axenthost.com/claim';
-const MAX_ATTEMPTS = 4;
+// v12（2026-11-06，#835–#838 原始日志复盘）：失败轮里同轮换新会话重试的实测通过率
+// 为 0（#811/#814–#816/#835–#838 共十余次 attempt≥2 无一成功；所有成功轮都赢在
+// 每轮第一个挑战实例上：#801/#809/#812/#822/#824）。高频撞挑战疑似只会喂高出口
+// IP 的风控分。故每轮失败尝试上限 4→2，轮与轮之间交给整点节奏重试。
+const MAX_ATTEMPTS = 2;
 // v7：上一轮记录挑战是否处于“不可见”状态。#770/#771 实证：挑战帧连续 8 次
 // 全程不可见时，换新会话重跑毫无意义，只会多送 3 次挑战交互、继续抬高风控评分。
 let lastTurnstileInvisible = false;
@@ -1005,6 +1009,14 @@ async function buildContext(browser) {
   let waitedShortCooldown = false;
 
   for (let attemptNo = 1; ; attemptNo++) {
+    // v12: 预算检查前移到尝试开始之前。#838 实证：旧逻辑只在失败后查 22 分钟预算，
+    // 第 4 次尝试在第 18 分钟启动、单次最长 ~6 分钟，叠加 job 前段 ~5 分钟开销后
+    // 撞穿 30 分钟 job 上限被强杀，连 FINAL 都没打出来。预算 12 分钟 + 开始前检查，
+    // 保证脚本永远在 job 上限内自己收尾。
+    if (attemptNo > 1 && Date.now() - runStartedAt > 12 * 60 * 1000) {
+      console.log('[run] time budget (12min) exhausted before new attempt, stopping cleanly');
+      break;
+    }
     console.log(`[run] attempt ${attemptNo}`);
     result = await claimOnce(context, attemptNo);
     console.log('[run] result:', JSON.stringify(result));
@@ -1045,8 +1057,8 @@ async function buildContext(browser) {
       // 由 failures 上限和时间预算收口。
       console.log('[run] invisible challenge on this attempt; treating as retryable verification failure (fresh session, per #809 evidence)');
     }
-    if (Date.now() - runStartedAt > 22 * 60 * 1000) {
-      console.log('[run] time budget (22min) exhausted, stopping before job timeout');
+    if (Date.now() - runStartedAt > 12 * 60 * 1000) {
+      console.log('[run] time budget (12min) exhausted, stopping before job timeout');
       break;
     }
     if (failures >= MAX_ATTEMPTS) break;
@@ -1055,7 +1067,8 @@ async function buildContext(browser) {
     if (result.reason === 'button-disabled-verification-failed' || result.reason === 'unknown-result') {
       console.log('[run] verification failed, relaunching browser with a fresh session...');
       await browser.close().catch(() => {});
-      await sleep(5000);
+      // v12: 重启前冷却 60s（旧 5s），避免同轮内高频连撞挑战继续喂高风控分
+      await sleep(60000);
       browser = await launchBrowser();
       context = await buildContext(browser);
     } else {
