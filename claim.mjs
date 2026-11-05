@@ -672,22 +672,52 @@ async function humanDwell(page, totalMs) {
   }
 }
 
+// v9：等领取页 UI 真正渲染出来（领取按钮 / 验证组件容器 / 挑战 iframe 任一出现）。
+// #792 实证：页面正文一直停在 "Loading..."，验证组件根本没被创建——
+// 旧流程在空白页上等 Turnstile 出现，等多久都不会有。
+async function waitForClaimUi(page, timeoutSec, tag) {
+  const start = Date.now();
+  let poll = 0;
+  while ((Date.now() - start) / 1000 < timeoutSec) {
+    poll++;
+    const st = await page.evaluate(() => {
+      const text = (document.body.innerText || '').replace(/\s+/g, ' ');
+      return {
+        loading: text.includes('Loading...'),
+        hasClaimBtn: !!Array.from(document.querySelectorAll('button')).find((b) => b.textContent.includes('Claim 3 credits')),
+        hasWidget: document.querySelectorAll('.cf-turnstile, [data-sitekey]').length > 0,
+        hasCfFrame: !!document.querySelector('iframe[src*="challenges.cloudflare.com"]'),
+        textLen: text.length,
+      };
+    }).catch(() => null);
+    if (st && (st.hasClaimBtn || st.hasWidget || st.hasCfFrame)) {
+      console.log(`[load:${tag}] claim UI ready ${JSON.stringify(st)}`);
+      return true;
+    }
+    if (st && poll % 6 === 1) console.log(`[load:${tag}] waiting UI ${JSON.stringify(st)}`);
+    await sleep(5000);
+  }
+  console.log(`[load:${tag}] claim UI not ready after ${timeoutSec}s`);
+  return false;
+}
+
 // 单次执行领取
 async function claimOnce(context, attemptIndex) {
   const page = await context.newPage();
 
   page.on('requestfailed', (req) => {
     const u = req.url();
-    if (u.includes('cloudflare') || u.includes('turnstile')) {
-      console.log(`[net] requestfailed ${u.slice(0, 90)} ${req.failure()?.errorText || ''}`);
-    }
+    console.log(`[net] requestfailed ${u.slice(0, 100)} ${req.failure()?.errorText || ''}`);
   });
   page.on('response', (res) => {
-    const u = res.url();
-    if ((u.includes('cloudflare') || u.includes('turnstile')) && res.status() >= 400) {
-      console.log(`[net] response ${res.status()} ${u.slice(0, 90)}`);
+    if (res.status() >= 400) {
+      console.log(`[net] response ${res.status()} ${res.url().slice(0, 100)}`);
     }
   });
+  page.on('console', (msg) => {
+    if (msg.type() === 'error') console.log(`[console] ${msg.text().slice(0, 160)}`);
+  });
+  page.on('pageerror', (err) => console.log(`[pageerror] ${String(err.message).slice(0, 160)}`));
 
   try {
     // v8 预热：先落站点首页拟人停留，再进领取页，而不是新会话第一跳直冲 /claim
@@ -704,6 +734,35 @@ async function claimOnce(context, attemptIndex) {
       iframes: Array.from(document.querySelectorAll('iframe')).map((f) => (f.getAttribute('src') || f.id || '').slice(0, 60)),
     })).catch(() => null);
     if (diag) console.log(`[diag] turnstileApi=${diag.turnstileApi} widgetDivs=${diag.widgetDivs} iframes=${JSON.stringify(diag.iframes)}`);
+
+    // v9：先确认领取页 UI 真的渲染完，再进入验证码流程；在 "Loading..." 空白页上等组件是无用功。
+    // 直连等 90s → 刷新再等 90s → 资源计时定因 + 改走 /servers 后 SPA 内导航到领取。
+    let uiReady = await waitForClaimUi(page, 90, 'direct');
+    if (!uiReady) {
+      const resTail = await page.evaluate(() => performance.getEntriesByType('resource').slice(-25).map((e) => `${e.name.slice(0, 80)} dur=${Math.round(e.duration)} end=${Math.round(e.responseEnd)}`)).catch(() => []);
+      console.log(`[load] resource timing tail: ${JSON.stringify(resTail)}`);
+      await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+      await sleep(3000);
+      await dismissAdModals(page);
+      uiReady = await waitForClaimUi(page, 90, 'reload');
+    }
+    if (!uiReady) {
+      console.log('[load] falling back to /servers then in-app navigation to claim...');
+      await page.goto('https://app.axenthost.com/servers', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+      await sleep(5000);
+      const creditsBtn = page.locator('a[href*="credits"], a:has-text("Credits")').first();
+      if (await creditsBtn.isVisible().catch(() => false)) {
+        await creditsBtn.click().catch(() => {});
+        await sleep(4000);
+      }
+      const claimEntry = page.locator('button:has-text("Claim free credits"), a:has-text("Claim free credits")').first();
+      if (await claimEntry.isVisible().catch(() => false)) {
+        await claimEntry.click().catch(() => {});
+        await sleep(4000);
+      }
+      uiReady = await waitForClaimUi(page, 60, 'spa-nav');
+      console.log(`[load] spa-nav result: uiReady=${uiReady} url=${page.url()}`);
+    }
 
     // 严谨登录校验
     const hasLogoutBtn = (await page.locator('text=/Log out/i').count()) > 0;
