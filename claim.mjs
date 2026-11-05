@@ -999,6 +999,7 @@ async function buildContext(browser) {
   };
 
   let result = { ok: false, reason: 'not-run' };
+  const runStartedAt = Date.now();
   let claimedCount = 0;
   let failures = 0;
   let waitedShortCooldown = false;
@@ -1031,14 +1032,21 @@ async function buildContext(browser) {
     }
 
     failures++;
-    // 不可见挑战直接快速失败：实证表明换新会话也一样不可见，继续重跑只会
-    // 多送挑战交互、抬高风控分；等下一小时风控冷却后再由定时运行重试。
+    // v11: 不可见挑战改为可重试（见下方 #809 实证说明）；401 过期仍立即停，
+    // 因为换会话也救不了死令牌，必须等新导出。
     if (result.reason === 'session-expired-api-401') {
       console.log('[run] stored session expired (API 401); retrying with the same secrets is pointless — needs a fresh login export');
       break;
     }
     if (result.invisibleChallenge) {
-      console.log('[run] invisible challenge confirmed, failing fast instead of relaunching (fresh sessions do not help)');
+      // v11: 不再快速失败。#809 实证：同一轮里第 1 次领取点选后通过（175s）、
+      // 第 2 次才撞上不可见挑战——不可见是按挑战实例随机的，换新会话/新页面
+      // 重试有真实通过率。落入下方验证失败分支：重启浏览器换新会话再试，
+      // 由 failures 上限和时间预算收口。
+      console.log('[run] invisible challenge on this attempt; treating as retryable verification failure (fresh session, per #809 evidence)');
+    }
+    if (Date.now() - runStartedAt > 22 * 60 * 1000) {
+      console.log('[run] time budget (22min) exhausted, stopping before job timeout');
       break;
     }
     if (failures >= MAX_ATTEMPTS) break;
