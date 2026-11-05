@@ -704,12 +704,14 @@ async function waitForClaimUi(page, timeoutSec, tag) {
 // 单次执行领取
 async function claimOnce(context, attemptIndex) {
   const page = await context.newPage();
+  let api401Count = 0;
 
   page.on('requestfailed', (req) => {
     const u = req.url();
     console.log(`[net] requestfailed ${u.slice(0, 100)} ${req.failure()?.errorText || ''}`);
   });
   page.on('response', (res) => {
+    if (res.status() === 401 && res.url().includes('api.axenthost.com')) api401Count++;
     if (res.status() >= 400) {
       console.log(`[net] response ${res.status()} ${res.url().slice(0, 100)}`);
     }
@@ -762,6 +764,15 @@ async function claimOnce(context, attemptIndex) {
       }
       uiReady = await waitForClaimUi(page, 60, 'spa-nav');
       console.log(`[load] spa-nav result: uiReady=${uiReady} url=${page.url()}`);
+    }
+
+    // v10：UI 始终不渲染且 API 连续 401 = 存储的会话令牌已失效（#793 实证：
+    // /v5/users/infos、/v5/servers 等全部 401，页面永远停在 Loading）。
+    // 这种情况继续等 Turnstile 毫无意义，立刻以明确原因失败，等 secrets 刷新。
+    if (!uiReady && api401Count >= 3) {
+      console.log(`[auth] claim UI never rendered and API returned 401 x${api401Count} — stored session token expired/invalid, secrets need a fresh login export`);
+      await takeScreenshot(page, `attempt${attemptIndex}-session-expired`);
+      return { ok: false, reason: 'session-expired-api-401' };
     }
 
     // 严谨登录校验
@@ -1022,6 +1033,10 @@ async function buildContext(browser) {
     failures++;
     // 不可见挑战直接快速失败：实证表明换新会话也一样不可见，继续重跑只会
     // 多送挑战交互、抬高风控分；等下一小时风控冷却后再由定时运行重试。
+    if (result.reason === 'session-expired-api-401') {
+      console.log('[run] stored session expired (API 401); retrying with the same secrets is pointless — needs a fresh login export');
+      break;
+    }
     if (result.invisibleChallenge) {
       console.log('[run] invisible challenge confirmed, failing fast instead of relaunching (fresh sessions do not help)');
       break;
