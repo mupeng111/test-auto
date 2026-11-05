@@ -2,6 +2,7 @@ import { chromium } from 'playwright';
 import fs from 'fs';
 import path from 'path';
 import zlib from 'zlib';
+import { execFile } from 'child_process';
 
 /* localStorage 导出超 45000 字节自动 gzip+base64 打包，注入时自动解压 */
 function packSecretValue(jsonStr) {
@@ -34,6 +35,33 @@ if (!fs.existsSync(SCREENSHOT_DIR)) {
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// v8：按出口 IP 的真实地理位置对齐浏览器时区。旧版写死 America/New_York，
+// 配新加坡/欧洲出口时与 IP 归属地严重不一致，是 Turnstile 评分的强扣分项。
+let egressGeoCache = null;
+async function detectEgressGeo() {
+  if (egressGeoCache) return egressGeoCache;
+  egressGeoCache = { timezone: null, country: null };
+  if (!PROXY_SERVER) return egressGeoCache;
+  const proxyArg = PROXY_SERVER.replace(/^socks5:/, 'socks5h:');
+  const urls = ['http://ip-api.com/json/?fields=status,timezone,countryCode', 'https://ipapi.co/json/'];
+  for (const u of urls) {
+    try {
+      const out = await new Promise((resolve, reject) => {
+        execFile('curl', ['-s', '-m', '10', '--proxy', proxyArg, u], (err, stdout) => (err ? reject(err) : resolve(stdout)));
+      });
+      const j = JSON.parse(out);
+      const tz = j.timezone || j.time_zone;
+      if (tz) {
+        egressGeoCache = { timezone: tz, country: j.countryCode || j.country_code || null };
+        console.log(`[geo] egress timezone=${tz} country=${egressGeoCache.country || '?'}`);
+        return egressGeoCache;
+      }
+    } catch {}
+  }
+  console.log('[geo] egress geo lookup failed, keeping default timezone');
+  return egressGeoCache;
+}
 
 async function takeScreenshot(page, name) {
   try {
@@ -292,6 +320,8 @@ async function checkTurnstileFailed(page) {
 // 诊断：列出页面上所有挑战 iframe 的外框与样式（排查坐标点击为何不生效）
 async function dumpChallengeFrames(page, tag) {
   try {
+    const allFrames = page.frames();
+    console.log(`[frames:${tag}] total=${allFrames.length} cf=${allFrames.filter((f) => f.url().includes('challenges.cloudflare.com')).length}`);
     for (const frame of page.frames()) {
       if (frame.url().includes('challenges.cloudflare.com')) {
         const el = await frame.frameElement().catch(() => null);
@@ -464,6 +494,13 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
         return true;
       }
       if (await checkTurnstileFailed(page)) break;
+      if (i > 0 && i % 5 === 0) {
+        // v8：不可见模式靠行为信号评分，等待期间保持轻微真实活动，而不是完全静止
+        const mx = 260 + Math.floor(Math.random() * 800);
+        const my = 180 + Math.floor(Math.random() * 420);
+        await page.mouse.move(mx, my, { steps: 10 }).catch(() => {});
+        if (i % 10 === 0) await page.mouse.wheel(0, 90).catch(() => {});
+      }
       await sweepFullscreenAds(page);
       if (!(await ensureOnSite(page))) break;
       await sleep(2000);
@@ -623,14 +660,50 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
   return false;
 }
 
+// 拟人停留：随机轨迹移动鼠标 + 小幅滚动，产生真实会话的行为信号
+async function humanDwell(page, totalMs) {
+  const steps = Math.max(2, Math.floor(totalMs / 2500));
+  for (let i = 0; i < steps; i++) {
+    const x = 300 + Math.floor(Math.random() * 900);
+    const y = 200 + Math.floor(Math.random() * 500);
+    await page.mouse.move(x, y, { steps: 12 }).catch(() => {});
+    if (i % 2 === 1) await page.mouse.wheel(0, 120 + Math.floor(Math.random() * 200)).catch(() => {});
+    await sleep(2000 + Math.floor(Math.random() * 800));
+  }
+}
+
 // 单次执行领取
 async function claimOnce(context, attemptIndex) {
   const page = await context.newPage();
 
+  page.on('requestfailed', (req) => {
+    const u = req.url();
+    if (u.includes('cloudflare') || u.includes('turnstile')) {
+      console.log(`[net] requestfailed ${u.slice(0, 90)} ${req.failure()?.errorText || ''}`);
+    }
+  });
+  page.on('response', (res) => {
+    const u = res.url();
+    if ((u.includes('cloudflare') || u.includes('turnstile')) && res.status() >= 400) {
+      console.log(`[net] response ${res.status()} ${u.slice(0, 90)}`);
+    }
+  });
+
   try {
+    // v8 预热：先落站点首页拟人停留，再进领取页，而不是新会话第一跳直冲 /claim
+    await page.goto('https://app.axenthost.com/', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+    await humanDwell(page, 9000);
     await ensureOnClaimPage(page);
     await sleep(2000);
     await dismissAdModals(page);
+
+    // v8 诊断：Turnstile 在页面上的真实存在形态（api 是否加载、容器、iframe 列表）
+    const diag = await page.evaluate(() => ({
+      turnstileApi: typeof window.turnstile,
+      widgetDivs: document.querySelectorAll('.cf-turnstile, [data-sitekey]').length,
+      iframes: Array.from(document.querySelectorAll('iframe')).map((f) => (f.getAttribute('src') || f.id || '').slice(0, 60)),
+    })).catch(() => null);
+    if (diag) console.log(`[diag] turnstileApi=${diag.turnstileApi} widgetDivs=${diag.widgetDivs} iframes=${JSON.stringify(diag.iframes)}`);
 
     // 严谨登录校验
     const hasLogoutBtn = (await page.locator('text=/Log out/i').count()) > 0;
@@ -662,6 +735,10 @@ async function claimOnce(context, attemptIndex) {
     });
 
     console.log(`[claim] remaining claims: ${availability.remaining === null ? 'unknown' : availability.remaining}`);
+    if (availability.remaining === null) {
+      const sample = await page.evaluate(() => (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 260)).catch(() => '');
+      console.log(`[claim] page text sample: ${sample}`);
+    }
 
     if (availability.remaining === 0 || (availability.remaining === null && availability.refill && !/Ready/i.test(availability.refill))) {
       console.log(`[claim] currently in cooldown: ${availability.refill || 'unknown'}`);
@@ -764,10 +841,11 @@ async function launchBrowser() {
 
 // 构建带指纹伪装与登录凭据注入的浏览器上下文
 async function buildContext(browser) {
+  const geo = await detectEgressGeo();
   const context = await browser.newContext({
     viewport: { width: 1920, height: 1080 },
     locale: 'en-US',
-    timezoneId: 'America/New_York',
+    timezoneId: geo.timezone || 'America/New_York',
   });
 
   // 注意：本站有广告拦截墙——拦截广告请求会整页替换成 Ad Blocker 提示（#743 实证），
@@ -784,6 +862,21 @@ async function buildContext(browser) {
         { name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
       ],
     });
+    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+    Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+    // v8：WebGL 渲染器字符串是虚拟机/无头环境的强特征（默认会报 SwiftShader），
+    // 改成常见 Intel 核显的 ANGLE 串，与真实桌面 Chrome 对齐。
+    const patchGL = (proto) => {
+      if (!proto) return;
+      const orig = proto.getParameter;
+      proto.getParameter = function (p) {
+        if (p === 37445) return 'Google Inc. (Intel)';
+        if (p === 37446) return 'ANGLE (Intel, Intel(R) Iris(R) Xe Graphics (0x000046A8) Direct3D11 vs_5_0 ps_5_0, D3D11)';
+        return orig.call(this, p);
+      };
+    };
+    patchGL(window.WebGLRenderingContext && WebGLRenderingContext.prototype);
+    patchGL(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype);
   });
   console.log('[browser] fingerprint init script added');
 
