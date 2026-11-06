@@ -158,13 +158,13 @@ async function exportFreshState(context, page) {
 
     const keepCookie = (item) => {
       const host = (item.domain || '').replace(/^\./, '').toLowerCase();
-      return (
-        host === 'axenthost.com' ||
-        host.endsWith('.axenthost.com') ||
-        host === 'challenges.cloudflare.com' ||
-        host === 'cloudflare.com' ||
-        host.endsWith('.cloudflare.com')
-      );
+      // v13（2026-11-06）：不再持久化 Cloudflare 域 cookie。__cf_bm / cf_clearance
+      // 这类挑战 cookie 是按出口 IP + 会话签发的，一旦某轮会话被风控标记，它的
+      // CF cookie 被每轮回写、每轮重放，就会形成"毒 cookie 死循环"——这与
+      // #835–#842 的实测形态完全吻合：令牌有效、页面正常、换两个出口同一种
+      // 死法、且成功轮（#801/#822/#824）的挑战都是在干净 CF 状态下被动通过的。
+      // 只持久化 axenthost.com 自家 cookie，CF 状态每轮从零开始。
+      return host === 'axenthost.com' || host.endsWith('.axenthost.com');
     };
 
     const freshCookies = mappedAll.filter(keepCookie);
@@ -971,7 +971,17 @@ async function buildContext(browser) {
   if (AXENT_COOKIES) {
     try {
       const parsed = JSON.parse(AXENT_COOKIES);
-      const cookies = parsed.map((item) => ({
+      // v13: 注入侧同步过滤存量 CF cookie——当前 secret 里还存着旧逻辑回写的
+      // cloudflare 域 cookie，不在注入侧拦掉的话，导出侧的修复要等一整轮才生效。
+      const cfCookieName = /^(cf_clearance|__cf_bm|__cflb|__cfruid|cf_chl_|cf_ob_|cf_use_ob)/;
+      const kept = parsed.filter((item) => {
+        const host = (item.domain || '').replace(/^\./, '').toLowerCase();
+        const isCfHost = host === 'cloudflare.com' || host.endsWith('.cloudflare.com');
+        return !isCfHost && !cfCookieName.test(item.name || '');
+      });
+      const dropped = parsed.length - kept.length;
+      if (dropped > 0) console.log(`[auth] dropped ${dropped} stored Cloudflare cookies at injection (v13)`);
+      const cookies = kept.map((item) => ({
         name: item.name,
         value: item.value,
         domain: item.domain,
