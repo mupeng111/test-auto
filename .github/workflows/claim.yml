@@ -80,6 +80,20 @@ jobs:
           fi
           xvfb-run -a node claim.mjs
 
+      - name: 导出会话状态供本地对照实验（临时）
+        # v16 临时：把 claim.mjs 刚回写的会话文件作为 artifact 导出一次，
+        # 用于在本地另一台主机上跑同一脚本、同一会话、同一出口做对照实验，
+        # 区分"GitHub runner 环境问题"与"会话/页面问题"。实验完成后删除本步骤。
+        # 注意：artifact 含登录会话，保留 1 天，实验后立即删除 artifact 与本轮运行。
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: claim-session-state
+          path: |
+            fresh-cookies.json
+            fresh-localstorage.json
+          retention-days: 1
+
       - name: 自动持久化回写最新的登录凭据
         if: always()
         continue-on-error: true
