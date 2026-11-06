@@ -459,203 +459,65 @@ async function ensureOnSite(page) {
   return true;
 }
 
-// Turnstile 求解：被动等待 → 组件卡死刷新 → iframe 外框坐标拟人点击。
-// 点击点位于组件左侧约 26px 的复选框中心（实测结构），点前先做遮挡检测，
-// 点后若组件明确判失败则刷新页面换一个全新挑战，而不是反复点击旧挑战。
+// Turnstile 求解 v18（2026-11-06）：
+// 本地 A/B 实测（同会话、同出口、同浏览器）：
+//   probeA（仅隐藏 webdriver，不动 DOM、不点）→ 43 秒隐形通过发 token；
+//   probeB（probeA + 指纹补丁）→ 43 秒时框翻成 300×65 互动模式，90 秒无 token。
+// 结论：指纹补丁本身就是触发互动模式的毒药（已在 buildContext 里删掉）。
+// 求解按 Heisi 定的逻辑：先被动等 token；框真渲染出内容（复选框）才点，
+// 点的是帧内元素本身；框是空的绝不盲点坐标——直接刷新换一个新挑战。
 async function waitAndSolveTurnstile(page, attemptIndex) {
   lastTurnstileInvisible = false;
   console.log('[turnstile] waiting for verification (passive first)...');
   const startedAt = Date.now();
   const waitedSec = () => Math.round((Date.now() - startedAt) / 1000);
 
-  await dismissAdModals(page);
-  await sweepFullscreenAds(page);
-  await ensureOnSite(page);
-
-  // 阶段 1：静默等待自动放行（缩短到 12 秒——插页广告随停留时间出现，越快进入点击越好）
-  for (let i = 0; i < 6; i++) {
+  // 阶段 1：被动等 token（最长 120 秒）。期间不改 DOM、不点、不清广告——
+  // probeA 证明静等就能过；任何页面改动都可能抬高风控。
+  for (let i = 0; i < 60; i++) {
     if (await checkTurnstilePassed(page)) {
       console.log(`[turnstile] passed passively (${waitedSec()}s)`);
       await takeScreenshot(page, `attempt${attemptIndex}-turnstile-passed`);
       return true;
     }
+    if (await checkTurnstileFailed(page)) break;
     if (i % 5 === 0) console.log(`[turnstile] securing waited ${waitedSec()}s`);
-    await sweepFullscreenAds(page);
-    if (!(await ensureOnSite(page))) break;
     await sleep(2000);
   }
 
-  // 阶段 1.2：不可见/未渲染模式耐心等待——挑战帧无文本时点击空处毫无意义，
-  // 不点击、不刷新，只静等其自动完成（最多 150 秒），避免高频交互继续抬高风控评分。
-  const frameText0 = await challengeFrameText(page);
-  if (!frameText0) {
-    lastTurnstileInvisible = true;
-    console.log('[turnstile] challenge frame empty (invisible/unrendered), waiting passively up to 150s...');
-    for (let i = 0; i < 75; i++) {
-      if (await checkTurnstilePassed(page)) {
-        console.log(`[turnstile] passed during invisible wait (${waitedSec()}s)`);
-        await takeScreenshot(page, `attempt${attemptIndex}-turnstile-passed`);
-        return true;
+  // 阶段 2：框已渲染出内容（真复选框）→ 帧内元素点击，等绿勾。
+  const frameText = await challengeFrameText(page);
+  if (frameText) {
+    console.log(`[turnstile] widget rendered (${JSON.stringify(frameText.slice(0, 80))}), clicking checkbox...`);
+    await dumpChallengeFrames(page, `a${attemptIndex}`);
+    const clicked = await tryInFrameClick(page);
+    if (clicked) {
+      for (let i = 0; i < 30; i++) {
+        if (await checkTurnstilePassed(page)) {
+          console.log(`[turnstile] passed after click (${waitedSec()}s)`);
+          await takeScreenshot(page, `attempt${attemptIndex}-turnstile-passed`);
+          return true;
+        }
+        if (await checkTurnstileFailed(page)) break;
+        await sleep(2000);
       }
-      if (await checkTurnstileFailed(page)) break;
-      if (i > 0 && i % 5 === 0) {
-        // v8：不可见模式靠行为信号评分，等待期间保持轻微真实活动，而不是完全静止
-        const mx = 260 + Math.floor(Math.random() * 800);
-        const my = 180 + Math.floor(Math.random() * 420);
-        await page.mouse.move(mx, my, { steps: 10 }).catch(() => {});
-        if (i % 10 === 0) await page.mouse.wheel(0, 90).catch(() => {});
-      }
-      await sweepFullscreenAds(page);
-      if (!(await ensureOnSite(page))) break;
-      await sleep(2000);
+    } else {
+      console.log('[turnstile] no clickable checkbox element in frame');
     }
-  }
-
-  // 组件缺失或卡死：刷新一次重置挑战环境
-  let widget = await getTurnstileWidget(page);
-  if (!widget) {
-    console.log('[turnstile] component stalled, reloading page to refresh challenge...');
+  } else {
+    // 框是空的：刷新换一个新挑战，再被动等 60 秒，绝不盲点坐标。
+    lastTurnstileInvisible = true;
+    console.log('[turnstile] challenge frame empty, reloading for a fresh challenge (no blind click)...');
     await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
     await sleep(3500);
-    await dismissAdModals(page);
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; i < 30; i++) {
       if (await checkTurnstilePassed(page)) {
         console.log(`[turnstile] passed after reload (${waitedSec()}s)`);
         await takeScreenshot(page, `attempt${attemptIndex}-turnstile-passed`);
         return true;
       }
+      if (await checkTurnstileFailed(page)) break;
       await sleep(2000);
-    }
-  }
-
-  // 阶段 1.5：帧内元素点击（坐标由浏览器在帧内解析，最多 2 次）
-  await dumpChallengeFrames(page, `a${attemptIndex}`);
-  for (let t = 1; t <= 2; t++) {
-    const clicked = await tryInFrameClick(page);
-    if (!clicked) break;
-    let failedSeen = false;
-    for (let i = 0; i < 15; i++) {
-      if (await checkTurnstilePassed(page)) {
-        console.log(`[turnstile] passed after in-frame click (${waitedSec()}s)`);
-        await takeScreenshot(page, `attempt${attemptIndex}-turnstile-passed`);
-        return true;
-      }
-      if (await checkTurnstileFailed(page)) { failedSeen = true; break; }
-      await sleep(2000);
-    }
-    if (failedSeen) {
-      console.log('[turnstile] in-frame click led to explicit failure, reloading for a fresh challenge...');
-      await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
-      await sleep(3500);
-      await dismissAdModals(page);
-    }
-  }
-
-  // 阶段 2：坐标拟人点击（最多 2 次；反复点击会重置组件的校验计时，所以点后耐心等满 60 秒）
-  for (let clickNo = 1; clickNo <= 2; clickNo++) {
-    await closeVignette(page);
-    await sweepFullscreenAds(page);
-    widget = await getTurnstileWidget(page);
-    if (!widget) {
-      console.log('[turnstile] checkbox not visible');
-      break;
-    }
-    try { await widget.frameEl.scrollIntoViewIfNeeded(); } catch {}
-    await sleep(800);
-
-    widget = await getTurnstileWidget(page);
-    if (!widget || !widget.box) break;
-
-    const dx = 26 + Math.round(Math.random() * 6 - 3);
-    const dy = Math.round(widget.box.height / 2 + (Math.random() * 6 - 3));
-    let cx = Math.round(widget.box.x + dx);
-    let cy = Math.round(widget.box.y + dy);
-
-    // 遮挡检测：点击坐标最上层元素不是组件 iframe 时，记录遮挡者身份并清理后重新定位。
-    // 清理只改遮挡元素自身的 pointer-events/visibility，绝不 display:none 祖先，避免页面布局位移让坐标失效。
-    const coverInfo = await page.evaluate(({ el, x, y }) => {
-      const top = document.elementFromPoint(x, y);
-      if (!top || top === el) return null;
-      const r = top.getBoundingClientRect();
-      const s = window.getComputedStyle(top);
-      return {
-        tag: top.tagName,
-        id: (top.id || '').slice(0, 40),
-        cls: String(top.className || '').slice(0, 60),
-        rect: [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)],
-        pos: s.position, z: s.zIndex, pe: s.pointerEvents, op: s.opacity,
-      };
-    }, { el: widget.frameEl, x: cx, y: cy }).catch(() => null);
-    if (coverInfo) {
-      console.log(`[turnstile] click point covered by ${JSON.stringify(coverInfo)}, neutralizing...`);
-      await dismissAdModals(page);
-      await page.evaluate(({ x, y }) => {
-        const top = document.elementFromPoint(x, y);
-        if (top && top.tagName !== 'IFRAME') {
-          top.style.pointerEvents = 'none';
-          top.style.visibility = 'hidden';
-        }
-      }, { x: cx, y: cy }).catch(() => {});
-      await sleep(600);
-      widget = await getTurnstileWidget(page);
-      if (!widget || !widget.box) break;
-      cx = Math.round(widget.box.x + dx);
-      cy = Math.round(widget.box.y + Math.round(widget.box.height / 2));
-      const stillCovered = await page.evaluate(({ el, x, y }) => {
-        const top = document.elementFromPoint(x, y);
-        return !!top && top !== el ? top.tagName : null;
-      }, { el: widget.frameEl, x: cx, y: cy }).catch(() => null);
-      console.log(`[turnstile] after neutralize, point top element: ${stillCovered || 'iframe (clear)'}`);
-    }
-
-    await sweepFullscreenAds(page);
-    if (!(await ensureOnSite(page))) {
-      widget = await getTurnstileWidget(page);
-      if (!widget || !widget.box) break;
-      cx = Math.round(widget.box.x + dx);
-      cy = Math.round(widget.box.y + Math.round(widget.box.height / 2));
-    }
-    if (clickNo === 1) await markClickPoint(page, cx, cy, `attempt${attemptIndex}-click-marker`);
-    await page.mouse.move(cx - 64, cy - 28, { steps: 9 });
-    await sleep(220);
-    await page.mouse.move(cx, cy, { steps: 13 });
-    await sleep(300 + Math.floor(Math.random() * 300));
-    await page.mouse.down();
-    await sleep(80 + Math.floor(Math.random() * 80));
-    await page.mouse.up();
-    console.log(`[turnstile] checkbox clicked (${clickNo}/2) at dx=${dx} dy=${dy}`);
-    await sleep(500);
-
-    let failedSeen = false;
-    for (let i = 0; i < 30; i++) {
-      if (await checkTurnstilePassed(page)) {
-        console.log(`[turnstile] passed after click (${waitedSec()}s)`);
-        await takeScreenshot(page, `attempt${attemptIndex}-turnstile-passed`);
-        return true;
-      }
-      if (await checkTurnstileFailed(page)) { failedSeen = true; break; }
-      if (i % 5 === 0) {
-        const t = await challengeFrameText(page);
-        if (t) console.log(`[turnstile] challenge state: ${t}`);
-      }
-      await sweepFullscreenAds(page);
-      await sleep(2000);
-    }
-
-    if (failedSeen) {
-      console.log('[turnstile] verification failed explicitly, reloading for a fresh challenge...');
-      await sleep(4000 + Math.floor(Math.random() * 3000));
-      await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
-      await sleep(3500);
-      await dismissAdModals(page);
-      for (let i = 0; i < 8; i++) {
-        if (await checkTurnstilePassed(page)) {
-          console.log(`[turnstile] passed after fresh challenge (${waitedSec()}s)`);
-          await takeScreenshot(page, `attempt${attemptIndex}-turnstile-passed`);
-          return true;
-        }
-        await sleep(2000);
-      }
     }
   }
 
@@ -957,25 +819,14 @@ async function buildContext(browser) {
   // 注意：本站有广告拦截墙——拦截广告请求会整页替换成 Ad Blocker 提示（#743 实证），
   // 因此绝不能在网络层拦广告；插页广告只能在页面内关闭/清扫（见 closeVignette）。
 
+  // v18（2026-11-06）：只留 webdriver 隐藏，其他指纹补丁全删。
+  // 本地 A/B 实测（同会话、同 hnhost 出口、同 bundled Chromium 158）：
+  //   probeA（仅本行补丁，不动 DOM、不点击）→ 43 秒隐形通过，token 到手；
+  //   probeB（probeA + 下面这批补丁）→ 43 秒时框翻成 300×65 互动模式，90 秒无 token。
+  // window.chrome / languages / plugins / hardwareConcurrency / deviceMemory
+  // 这些补丁就是把 CF 从隐形模式逼成互动模式的毒药——删掉，不要再加回来。
   await context.addInitScript(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    if (!window.chrome) window.chrome = { runtime: {} };
-    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-    Object.defineProperty(navigator, 'plugins', {
-      get: () => [
-        { name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-        { name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-        { name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-      ],
-    });
-    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
-    Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
-    // v15（2026-11-06）：删掉 v8 的 WebGL 渲染器伪装。#845 的 [env] 诊断实测：
-    // 页面看到的 UA 是 X11 Linux + Chrome/156，而伪装串是 Windows 的
-    // "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics ... Direct3D11)"——
-    // D3D11 根本不存在于 Linux 上，这是 UA 与 GPU 字符串自相矛盾的强机器人信号。
-    // 伪装存在期间也曾成功（#801–#834），但 05:00 翻转后它就是环境数据里最扎眼的
-    // 不一致项；先还原理想渲染器（与 Linux UA 自洽），用 v14 的 [env] 日志验证生效。
   });
   console.log('[browser] fingerprint init script added');
 
