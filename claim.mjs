@@ -741,6 +741,38 @@ async function claimOnce(context, attemptIndex) {
     })).catch(() => null);
     if (diag) console.log(`[diag] turnstileApi=${diag.turnstileApi} widgetDivs=${diag.widgetDivs} iframes=${JSON.stringify(diag.iframes)}`);
 
+    // v14 诊断（2026-11-06）：把页面实际看到的浏览器环境一次性打全——UA、平台、
+    // WebGL 渲染器（页面视角，已含 init script 补丁后的值）、时区、语言、存储键名。
+    // #835 起在无任何代码变更下由全过变全挂，环境侧必须先有可比对的实测数据再动手。
+    // 只打名称/公开属性，绝不打 cookie 值与存储值。
+    const envDiag = await page.evaluate(() => {
+      let gl = null;
+      try {
+        const c = document.createElement('canvas');
+        const g = c.getContext('webgl') || c.getContext('experimental-webgl');
+        if (g) {
+          const ext = g.getExtension('WEBGL_debug_renderer_info');
+          gl = ext ? String(g.getParameter(ext.UNMASKED_RENDERER_WEBGL)) : String(g.getParameter(g.RENDERER));
+        }
+      } catch (e) { gl = 'err:' + e.message; }
+      return {
+        ua: navigator.userAgent,
+        platform: navigator.platform,
+        uaDataPlatform: (navigator.userAgentData && navigator.userAgentData.platform) || null,
+        lang: navigator.language,
+        tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        tzOffsetMin: new Date().getTimezoneOffset(),
+        screen: `${screen.width}x${screen.height}@${window.devicePixelRatio}`,
+        cores: navigator.hardwareConcurrency,
+        gl,
+        lsKeys: Object.keys(localStorage),
+      };
+    }).catch((e) => ({ err: e.message }));
+    console.log(`[env] ${JSON.stringify(envDiag)}`);
+    const cookieNames = (await context.cookies('https://app.axenthost.com').catch(() => []))
+      .map((c) => `${c.name}@${c.domain}`);
+    console.log(`[env] cookies(${cookieNames.length}): ${JSON.stringify(cookieNames)}`);
+
     // v9：先确认领取页 UI 真的渲染完，再进入验证码流程；在 "Loading..." 空白页上等组件是无用功。
     // 直连等 90s → 刷新再等 90s → 资源计时定因 + 改走 /servers 后 SPA 内导航到领取。
     let uiReady = await waitForClaimUi(page, 90, 'direct');
