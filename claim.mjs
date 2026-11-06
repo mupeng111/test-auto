@@ -970,19 +970,12 @@ async function buildContext(browser) {
     });
     Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
     Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
-    // v8：WebGL 渲染器字符串是虚拟机/无头环境的强特征（默认会报 SwiftShader），
-    // 改成常见 Intel 核显的 ANGLE 串，与真实桌面 Chrome 对齐。
-    const patchGL = (proto) => {
-      if (!proto) return;
-      const orig = proto.getParameter;
-      proto.getParameter = function (p) {
-        if (p === 37445) return 'Google Inc. (Intel)';
-        if (p === 37446) return 'ANGLE (Intel, Intel(R) Iris(R) Xe Graphics (0x000046A8) Direct3D11 vs_5_0 ps_5_0, D3D11)';
-        return orig.call(this, p);
-      };
-    };
-    patchGL(window.WebGLRenderingContext && WebGLRenderingContext.prototype);
-    patchGL(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype);
+    // v15（2026-11-06）：删掉 v8 的 WebGL 渲染器伪装。#845 的 [env] 诊断实测：
+    // 页面看到的 UA 是 X11 Linux + Chrome/156，而伪装串是 Windows 的
+    // "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics ... Direct3D11)"——
+    // D3D11 根本不存在于 Linux 上，这是 UA 与 GPU 字符串自相矛盾的强机器人信号。
+    // 伪装存在期间也曾成功（#801–#834），但 05:00 翻转后它就是环境数据里最扎眼的
+    // 不一致项；先还原理想渲染器（与 Linux UA 自洽），用 v14 的 [env] 日志验证生效。
   });
   console.log('[browser] fingerprint init script added');
 
