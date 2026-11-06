@@ -60,7 +60,19 @@ jobs:
           "
 
           echo "Testing proxy connection to external network..."
-          if curl -s -m 10 --socks5 127.0.0.1:1080 https://api.ipify.org; then
+          # v19: 连通测试最多重试 5 次（间隔 5 秒）——hnhost 这类游戏服出口偶发 EOF，
+          # 一次失败就整轮报销太脆（2026-11-06 14:00 轮实证：第 6 步单次 EOF 失败，
+          # 随后本地同出口连续 3 次 200）。
+          PROXY_OK=0
+          for i in 1 2 3 4 5; do
+            if curl -s -m 10 --socks5 127.0.0.1:1080 https://api.ipify.org; then
+              PROXY_OK=1
+              break
+            fi
+            echo "proxy test attempt $i failed, retrying in 5s..."
+            sleep 5
+          done
+          if [ "$PROXY_OK" = "1" ]; then
             echo -e "\nProxy connection successful!"
             echo "PROXY_SERVER=socks5://127.0.0.1:1080" >> $GITHUB_ENV
           else
