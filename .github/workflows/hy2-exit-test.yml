@@ -1,0 +1,42 @@
+name: hy2-exit-test
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Download sing-box
+        run: |
+          curl -fsSL -o sb.tar.gz https://github.com/SagerNet/sing-box/releases/download/v1.14.3/sing-box-1.14.3-linux-amd64.tar.gz
+          tar xzf sb.tar.gz
+          cp sing-box-1.14.3-linux-amd64/sing-box ./sing-box
+          ./sing-box version
+      - name: Write client config
+        env:
+          PW: ${{ secrets.PRIOR_HY2_PW }}
+        run: |
+          cat > client.json << EOF
+          {
+            "log": { "level": "info" },
+            "inbounds": [ { "type": "socks", "listen": "127.0.0.1", "listen_port": 11080 } ],
+            "outbounds": [
+              { "type": "hysteria2", "tag": "hy2", "server": "sg.priornetwork.com", "server_port": 19502, "password": "$PW", "tls": { "enabled": true, "server_name": "www.bing.com", "alpn": ["h3"], "insecure": true } },
+              { "type": "direct", "tag": "direct" }
+            ],
+            "route": { "final": "hy2" }
+          }
+          EOF
+          ./sing-box check -c client.json && echo CONFIG-OK
+      - name: Test exit through HY2
+        run: |
+          ./sing-box run -c client.json > sb.log 2>&1 &
+          sleep 3
+          echo "== EXIT IP =="
+          curl -s --max-time 25 -x socks5h://127.0.0.1:11080 https://api.ipify.org || echo "IPIFY-FAILED"
+          echo ""
+          echo "== EXIT GEO =="
+          curl -s --max-time 25 -x socks5h://127.0.0.1:11080 https://ipinfo.io/json || echo "IPINFO-FAILED"
+          echo ""
+          echo "== SB LOG TAIL =="
+          tail -15 sb.log
