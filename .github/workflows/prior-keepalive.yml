@@ -46,13 +46,8 @@ jobs:
             exit 1
           fi
           echo "HY2 OK"
-      - name: Minecraft status ping (players online)
-        run: |
-          pip install --quiet mcstatus
-          python3 - << 'PY'
-          from mcstatus import JavaServer
-          s = JavaServer.lookup("sg2.priornetwork.com:24481").status()
-          print("players online:", s.players.online, "/", s.players.max, "| latency ms:", round(s.latency, 1))
-          assert s.players.online >= 1, "no players online - keepalive bots down?"
-          print("MC OK")
-          PY
+      # NOTE: no Minecraft status ping step — the panel's public address
+      # sg2.priornetwork.com has no public DNS records (verified 2026-11-08
+      # via Google/Cloudflare DNS), so an external SLP ping is impossible.
+      # The HY2 check above is the liveness signal: sing-box runs inside the
+      # Paper server, so a dead/sleeping server fails the HY2 check too.
