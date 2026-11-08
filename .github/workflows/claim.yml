@@ -39,15 +39,28 @@ jobs:
             exit 0
           fi
           SB_VER=1.12.0
+          SB_BIN="./sing-box-${SB_VER}-linux-amd64/sing-box"
           # v20（2026-11-08）：GitHub release 下载偶发 504 返回 HTML 错误页，tar 直接报
           # "not in gzip format" 杀死整轮（#920/#921 实测）。-f 让 HTTP 错误即失败，
-          # --retry 让瞬时故障自动重试，解压前校验 gzip 魔数，坏包给出明错。
-          curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -o sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-amd64.tar.gz"
-          head -c 2 sb.tar.gz | grep -q $'\x1f\x8b' || { echo "sing-box download is not gzip (HTTP error page), aborting"; head -c 300 sb.tar.gz; exit 1; }
-          tar xzf sb.tar.gz
+          # --retry 让瞬时故障自动重试，解压前校验 gzip 魔数。
+          # v21（2026-11-08）：release-assets CDN 持续 504（#920/#921/验证轮 6 次重试全败），
+          # 下载失败时改走官方 APT 仓库（deb.sagernet.org，另一主机）装 sing-box。
+          if curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -o sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-amd64.tar.gz" \
+             && head -c 2 sb.tar.gz | grep -q $'\x1f\x8b'; then
+            tar xzf sb.tar.gz
+          else
+            echo "GitHub release download failed, falling back to official APT repo..."
+            sudo mkdir -p /etc/apt/keyrings
+            sudo curl -fsSL https://sing-box.app/gpg.key -o /etc/apt/keyrings/sagernet.asc
+            sudo chmod a+r /etc/apt/keyrings/sagernet.asc
+            echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/sagernet.asc] https://deb.sagernet.org/ * *" | sudo tee /etc/apt/sources.list.d/sagernet.list
+            sudo apt-get update
+            sudo apt-get install -y sing-box
+            SB_BIN="sing-box"
+          fi
           node setup-proxy.mjs > sb-config.json
 
-          ./sing-box-${SB_VER}-linux-amd64/sing-box run -c sb-config.json > sing-box.log 2>&1 &
+          "$SB_BIN" run -c sb-config.json > sing-box.log 2>&1 &
           
           echo "waiting for proxy port..."
           node -e "
