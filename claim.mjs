@@ -1057,8 +1057,11 @@ async function buildContext(browser) {
       const r = await reloginViaDiscord(context);
       console.log('[relogin] proactive relogin result:', JSON.stringify(r));
     } else {
-      console.log('[relogin] token fresh enough, skipping proactive relogin');
+      console.log(`[relogin] token fresh enough, skipping proactive relogin (will trigger after ${new Date(exp - 90 * 60 * 1000).toISOString()})`);
     }
+  } else {
+    const exp = storedAuthExpiresAt();
+    console.log(`[relogin] DISCORD_* secrets not configured — auto relogin disarmed (v21 behaviour); stored token expiresAt=${exp ? new Date(exp).toISOString() : 'unknown'}`);
   }
 
   for (let attemptNo = 1; ; attemptNo++) {
