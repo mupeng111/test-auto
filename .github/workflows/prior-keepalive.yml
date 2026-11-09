@@ -1,7 +1,6 @@
 name: prior-keepalive
 on:
-  schedule:
-    - cron: "23 */6 * * *"
+  # schedule PAUSED 2026-11-09: account suspended, node dead. Manual dispatch only.
   workflow_dispatch:
 jobs:
   check:
