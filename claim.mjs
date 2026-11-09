@@ -265,6 +265,22 @@ async function reloginViaDiscord(context) {
         try {
           const a = JSON.parse(authJson);
           const exp = a?.token?.expiresAt ? Date.parse(a.token.expiresAt) : 0;
+          // v22.1（2026-11-09 晚）：账号身份校验。新令牌的账号必须与旧令牌一致，
+          // 否则 DISCORD 会话若是另一个 Discord 号（如 slabykh.1982），重登会把
+          // 主号的 secrets 覆盖成空号令牌，整点领取直接断供。身份不一致时拒绝
+          // 换令牌、不回写，本轮继续用旧令牌领取，旧令牌在到期前仍有效。
+          const idOf = (u) => (u ? (u.email || u.pseudo || u.username || null) : null);
+          let oldId = null;
+          try {
+            const oldStorage = JSON.parse(unpackSecretValue(AXENT_LOCAL_STORAGE));
+            oldId = idOf(oldStorage.auth ? JSON.parse(oldStorage.auth).user : null);
+          } catch {}
+          const newId = idOf(a?.user);
+          if (oldId && newId && oldId !== newId) {
+            console.log(`[relogin] ACCOUNT MISMATCH: new token user=${newId} != stored user=${oldId}; refusing to replace secrets`);
+            await takeScreenshot(page, 'relogin-account-mismatch');
+            return { ok: false, reason: 'relogin-account-mismatch', expected: oldId, got: newId };
+          }
           if (exp > prevExp + 60000 && exp - Date.now() > 3 * 3600 * 1000) {
             freshAuthJson = authJson;
             console.log(`[relogin] fresh token minted, expiresAt=${a.token.expiresAt}, user=${a?.user?.pseudo || a?.user?.email || '?'}`);
