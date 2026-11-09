@@ -113,7 +113,6 @@ jobs:
 
       - name: 自动持久化回写最新的登录凭据
         if: always()
-        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
@@ -121,42 +120,46 @@ jobs:
             echo "GH_PAT not set, skipping secret refresh"
             exit 0
           fi
+
           COOKIE_STATUS="skipped (no file)"
           STORAGE_STATUS="skipped (no file)"
+          DISCORD_COOKIE_STATUS="skipped (no file)"
+          DISCORD_STORAGE_STATUS="skipped (no file)"
+
+          # 1. 回写 AxentHost 最新登录凭据
           if [ -f fresh-cookies.json ]; then
             if gh secret set AXENT_COOKIES --repo ${{ github.repository }} < fresh-cookies.json; then
               COOKIE_STATUS="updated"
             else
               COOKIE_STATUS="FAILED"
-              echo "::warning::failed to refresh AXENT_COOKIES"
             fi
           fi
+
           if [ -f fresh-localstorage.json ]; then
             if gh secret set AXENT_LOCAL_STORAGE --repo ${{ github.repository }} < fresh-localstorage.json; then
               STORAGE_STATUS="updated"
             else
               STORAGE_STATUS="FAILED"
-              echo "::warning::failed to refresh AXENT_LOCAL_STORAGE"
             fi
           fi
-          DISCORD_COOKIE_STATUS="skipped (no file)"
-          DISCORD_STORAGE_STATUS="skipped (no file)"
+
+          # 2. 回写 Discord 滚动凭据（保障自动重登长期免维护）
           if [ -f fresh-discord-cookies.json ]; then
             if gh secret set DISCORD_COOKIES --repo ${{ github.repository }} < fresh-discord-cookies.json; then
               DISCORD_COOKIE_STATUS="updated"
             else
               DISCORD_COOKIE_STATUS="FAILED"
-              echo "::warning::failed to refresh DISCORD_COOKIES"
             fi
           fi
+
           if [ -f fresh-discord-localstorage.json ]; then
             if gh secret set DISCORD_LOCAL_STORAGE --repo ${{ github.repository }} < fresh-discord-localstorage.json; then
               DISCORD_STORAGE_STATUS="updated"
             else
               DISCORD_STORAGE_STATUS="FAILED"
-              echo "::warning::failed to refresh DISCORD_LOCAL_STORAGE"
             fi
           fi
+
           rm -f fresh-cookies.json fresh-localstorage.json fresh-discord-cookies.json fresh-discord-localstorage.json
           echo "Refresh summary: AXENT_COOKIES=$COOKIE_STATUS, AXENT_LOCAL_STORAGE=$STORAGE_STATUS, DISCORD_COOKIES=$DISCORD_COOKIE_STATUS, DISCORD_LOCAL_STORAGE=$DISCORD_STORAGE_STATUS"
 
