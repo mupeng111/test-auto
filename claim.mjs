@@ -36,13 +36,9 @@ const DISCORD_LOCAL_STORAGE = process.env.DISCORD_LOCAL_STORAGE || '';
 let freshAuthJson = null;
 let reloginTried = false;
 const CLAIM_URL = 'https://app.axenthost.com/claim';
-// v12（2026-11-06，#835–#838 原始日志复盘）：失败轮里同轮换新会话重试的实测通过率
-// 为 0（#811/#814–#816/#835–#838 共十余次 attempt≥2 无一成功；所有成功轮都赢在
-// 每轮第一个挑战实例上：#801/#809/#812/#822/#824）。高频撞挑战疑似只会喂高出口
-// IP 的风控分。故每轮失败尝试上限 4→2，轮与轮之间交给整点节奏重试。
+// v12（2026-11-06）：每轮失败尝试上限 2 次，轮与轮之间交给整点节奏重试。
 const MAX_ATTEMPTS = 2;
-// v7：上一轮记录挑战是否处于“不可见”状态。#770/#771 实证：挑战帧连续 8 次
-// 全程不可见时，换新会话重跑毫无意义，只会多送 3 次挑战交互、继续抬高风控评分。
+// v7：记录挑战是否处于“不可见”状态。
 let lastTurnstileInvisible = false;
 
 const SCREENSHOT_DIR = 'screenshots';
@@ -52,8 +48,7 @@ if (!fs.existsSync(SCREENSHOT_DIR)) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// v8：按出口 IP 的真实地理位置对齐浏览器时区。旧版写死 America/New_York，
-// 配新加坡/欧洲出口时与 IP 归属地严重不一致，是 Turnstile 评分的强扣分项。
+// v8：按出口 IP 的真实地理位置对齐浏览器时区。
 let egressGeoCache = null;
 async function detectEgressGeo() {
   if (egressGeoCache) return egressGeoCache;
@@ -89,8 +84,7 @@ async function takeScreenshot(page, name) {
   }
 }
 
-// 模拟 ESC，清理弹窗广告（领取页实测有固定广告横幅会盖住 Turnstile 组件，
-// 需一并尝试关闭带关闭按钮的广告容器）
+// 模拟 ESC，清理弹窗广告
 async function dismissAdModals(page) {
   try {
     await page.keyboard.press('Escape');
@@ -114,15 +108,14 @@ async function dismissAdModals(page) {
   } catch {}
 }
 
-// 定位可见的 Turnstile 组件（沿用实证有效的 iframe 外框定位法：
-// 通过 frameElement 拿到组件在主页面中的真实外框与坐标）
+// 定位可见的 Turnstile 组件外框
 async function getTurnstileWidget(page) {
   for (const frame of page.frames()) {
     if (frame.url().includes('challenges.cloudflare.com')) {
       const frameEl = await frame.frameElement().catch(() => null);
       if (frameEl) {
         const box = await frameEl.boundingBox().catch(() => null);
-        if (box && box.width >= 200 && box.width <= 380 && box.height >= 40 && box.height <= 90) {
+        if (box && box.width >= 150 && box.width <= 400 && box.height >= 40 && box.height <= 120) {
           return { frameEl, box };
         }
       }
@@ -134,7 +127,7 @@ async function getTurnstileWidget(page) {
     const srcAttr = (await iframe.getAttribute('src').catch(() => '')) || '';
     if (srcAttr.includes('challenges.cloudflare.com') || srcAttr.includes('turnstile')) {
       const box = await iframe.boundingBox().catch(() => null);
-      if (box && box.width >= 200 && box.width <= 380 && box.height >= 40 && box.height <= 90) {
+      if (box && box.width >= 150 && box.width <= 400 && box.height >= 40 && box.height <= 120) {
         return { frameEl: iframe, box };
       }
     }
@@ -143,8 +136,7 @@ async function getTurnstileWidget(page) {
   return null;
 }
 
-// 导出凭据：加入防毒保护，未处于登录态时绝不生成文件并清理脏文件
-// v22：解析当前 secret 里 Axent 令牌的到期时刻（毫秒），解析失败返回 null
+// v22：解析当前 secret 里 Axent 令牌的到期时刻（毫秒）
 function storedAuthExpiresAt() {
   try {
     if (!AXENT_LOCAL_STORAGE) return null;
@@ -157,8 +149,7 @@ function storedAuthExpiresAt() {
   }
 }
 
-// v22：把 Discord 会话注入上下文（localStorage 只在 discord.com 域生效，
-// 以免 Discord 的 token 键污染 Axent 本源存储、被 Axent 导出误带出去）
+// v22：把 Discord 会话注入上下文
 async function injectDiscordSession(context) {
   if (DISCORD_LOCAL_STORAGE) {
     try {
@@ -197,14 +188,13 @@ async function injectDiscordSession(context) {
   }
 }
 
-// v22：导出 Discord 会话（只留 token 类键 + discord.com 自家 cookie），供回写
-// 让 Discord 会话跟着每轮滚动更新。Discord 本源没被访问过时直接跳过。
+// v22：导出 Discord 会话
 async function exportDiscordState(context) {
   try {
     const state = await context.storageState();
     const origin = (state.origins || []).find((o) => o.origin === 'https://discord.com');
     const items = origin?.localStorage || [];
-    if (!items.some((i) => i.name === 'token' && i.value)) return false;
+    if (!items.some((i) => (i.name === 'token' || i.name === 'tokens') && i.value)) return false;
     const keep = {};
     for (const i of items) {
       if (i.name === 'token' || i.name === 'tokens') keep[i.name] = i.value;
@@ -234,9 +224,7 @@ async function exportDiscordState(context) {
   return false;
 }
 
-// v22：走 Discord OAuth 给 Axent 换一枚新 24h 令牌。
-// 云浏览器实测（2026-11-09）：已登录的 Discord 会话点 Login with Discord →
-// 授权页点一次 Authorise → 跳回站内即完成；无密码、无验证码、无邮箱验证。
+// v22：走 Discord OAuth 换新 24h 令牌
 async function reloginViaDiscord(context) {
   const prevExp = storedAuthExpiresAt() || 0;
   const page = await context.newPage();
@@ -277,7 +265,6 @@ async function reloginViaDiscord(context) {
         try {
           const a = JSON.parse(authJson);
           const exp = a?.token?.expiresAt ? Date.parse(a.token.expiresAt) : 0;
-          // 必须是比旧令牌更新、且寿命充足的令牌，防把旧 auth 误判为重登成功
           if (exp > prevExp + 60000 && exp - Date.now() > 3 * 3600 * 1000) {
             freshAuthJson = authJson;
             console.log(`[relogin] fresh token minted, expiresAt=${a.token.expiresAt}, user=${a?.user?.pseudo || a?.user?.email || '?'}`);
@@ -297,7 +284,6 @@ async function reloginViaDiscord(context) {
 }
 
 async function exportFreshState(context, page) {
-  // v22：Discord 会话导出独立于 Axent 登录态，单独跑一份
   await exportDiscordState(context).catch(() => {});
   try {
     if (page) {
@@ -324,12 +310,6 @@ async function exportFreshState(context, page) {
 
     const keepCookie = (item) => {
       const host = (item.domain || '').replace(/^\./, '').toLowerCase();
-      // v13（2026-11-06）：不再持久化 Cloudflare 域 cookie。__cf_bm / cf_clearance
-      // 这类挑战 cookie 是按出口 IP + 会话签发的，一旦某轮会话被风控标记，它的
-      // CF cookie 被每轮回写、每轮重放，就会形成"毒 cookie 死循环"——这与
-      // #835–#842 的实测形态完全吻合：令牌有效、页面正常、换两个出口同一种
-      // 死法、且成功轮（#801/#822/#824）的挑战都是在干净 CF 状态下被动通过的。
-      // 只持久化 axenthost.com 自家 cookie，CF 状态每轮从零开始。
       return host === 'axenthost.com' || host.endsWith('.axenthost.com');
     };
 
@@ -353,7 +333,6 @@ async function exportFreshState(context, page) {
       }
     }
 
-    // v22：本轮 OAuth 换过令牌时以新鲜 auth 为准，防止上下文里的旧值反写覆盖
     if (freshAuthJson) freshStorage['auth'] = freshAuthJson;
 
     if (freshStorage['auth']) {
@@ -430,14 +409,12 @@ async function ensureOnClaimPage(page) {
   return await isDirectlyReady();
 }
 
-// 校验 Turnstile 是否真正放行：主页面 token/按钮状态为主判据，
-// 并穿透检查挑战 iframe 内部的成功文本（成功提示渲染在跨域 iframe 内，
-// 只看主页面 innerText 永远读不到）
+// 校验 Turnstile 是否真正放行（支持穿透 Shadow DOM 读取组件内成功提示）
 async function checkTurnstilePassed(page) {
   try {
     const main = await page.evaluate(() => {
-      const input = document.querySelector('input[name="cf-turnstile-response"], input[name*="turnstile-response"]');
-      const hasToken = !!(input && input.value && input.value.length > 20);
+      const inputs = Array.from(document.querySelectorAll('input[name="cf-turnstile-response"], input[name*="turnstile-response"]'));
+      const hasToken = inputs.some((i) => i.value && i.value.length > 20);
 
       const text = document.body.innerText || '';
       const isVerifiedText = text.includes('Verified, you are human') || text.includes('成功！') || text.includes('Verification Success');
@@ -464,7 +441,19 @@ async function checkTurnstilePassed(page) {
     const cfFrame = page.frames().find((f) => f.url().includes('challenges.cloudflare.com'));
     if (cfFrame) {
       const inFrame = await cfFrame.evaluate(() => {
-        const t = document.body ? document.body.innerText : '';
+        const extractText = (root) => {
+          if (!root) return '';
+          let str = '';
+          for (const node of root.childNodes) {
+            if (node.nodeType === Node.TEXT_NODE) str += ' ' + node.textContent;
+            if (node.nodeType === Node.ELEMENT_NODE) {
+              if (node.shadowRoot) str += ' ' + extractText(node.shadowRoot);
+              str += ' ' + extractText(node);
+            }
+          }
+          return str;
+        };
+        const t = extractText(document.body);
         return t.includes('Success') || t.includes('成功') || t.includes('Verified');
       }).catch(() => false);
       if (inFrame) return true;
@@ -475,14 +464,25 @@ async function checkTurnstilePassed(page) {
   }
 }
 
-// 检测 Turnstile 是否已明确判定失败（组件会显示 Verification failed 并重置，
-// 读到失败就立刻换新挑战，不要在已判死的挑战上继续等满超时）
+// 检测 Turnstile 是否明确判定失败（穿透 Shadow DOM）
 async function checkTurnstileFailed(page) {
   try {
     const cfFrame = page.frames().find((f) => f.url().includes('challenges.cloudflare.com'));
     if (!cfFrame) return false;
     return await cfFrame.evaluate(() => {
-      const t = document.body ? document.body.innerText : '';
+      const extractText = (root) => {
+        if (!root) return '';
+        let str = '';
+        for (const node of root.childNodes) {
+          if (node.nodeType === Node.TEXT_NODE) str += ' ' + node.textContent;
+          if (node.nodeType === Node.ELEMENT_NODE) {
+            if (node.shadowRoot) str += ' ' + extractText(node.shadowRoot);
+            str += ' ' + extractText(node);
+          }
+        }
+        return str;
+      };
+      const t = extractText(document.body);
       return /verification failed|验证失败|驗證失敗/i.test(t);
     }).catch(() => false);
   } catch {
@@ -490,7 +490,7 @@ async function checkTurnstileFailed(page) {
   }
 }
 
-// 诊断：列出页面上所有挑战 iframe 的外框与样式（排查坐标点击为何不生效）
+// 诊断挑战 Frame 状态
 async function dumpChallengeFrames(page, tag) {
   try {
     const allFrames = page.frames();
@@ -504,7 +504,21 @@ async function dumpChallengeFrames(page, tag) {
           const s = window.getComputedStyle(n);
           return { pe: s.pointerEvents, vis: s.visibility, op: s.opacity, disp: s.display };
         }).catch(() => null);
-        const txt = await frame.evaluate(() => (document.body?.innerText || '').replace(/\s+/g, ' ').slice(0, 120)).catch(() => null);
+        const txt = await frame.evaluate(() => {
+          const extractText = (root) => {
+            if (!root) return '';
+            let str = '';
+            for (const node of root.childNodes) {
+              if (node.nodeType === Node.TEXT_NODE) str += ' ' + node.textContent;
+              if (node.nodeType === Node.ELEMENT_NODE) {
+                if (node.shadowRoot) str += ' ' + extractText(node.shadowRoot);
+                str += ' ' + extractText(node);
+              }
+            }
+            return str;
+          };
+          return extractText(document.body).replace(/\s+/g, ' ').slice(0, 120);
+        }).catch(() => null);
         console.log(`[frames:${tag}] box=${JSON.stringify(box)} style=${JSON.stringify(style)} text=${JSON.stringify(txt)}`);
       }
     }
@@ -513,54 +527,121 @@ async function dumpChallengeFrames(page, tag) {
   }
 }
 
-// 帧内点击：直接对挑战 iframe 内部的复选框元素执行 Playwright 点击，
-// 坐标由浏览器在帧内解析，绕开主页面 elementFromPoint 与外框坐标的偏差。
+// 检查挑战组件是否已挂载到 DOM 中（穿透 Shadow DOM）
+async function checkChallengeRendered(page) {
+  try {
+    const fl = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
+    const candidates = [
+      fl.locator('label.cb-lb'),
+      fl.locator('input[type="checkbox"]'),
+      fl.locator('.ctp-checkbox-label'),
+      fl.getByRole('checkbox'),
+      fl.locator('label'),
+      fl.locator('#challenge-stage')
+    ];
+    for (const target of candidates) {
+      const count = await target.count().catch(() => 0);
+      if (count > 0 && await target.first().isVisible().catch(() => false)) {
+        return { rendered: true, target: target.first() };
+      }
+    }
+  } catch {}
+
+  const widget = await getTurnstileWidget(page);
+  if (widget && widget.box) {
+    return { rendered: true, target: null };
+  }
+  return { rendered: false, target: null };
+}
+
+// 帧内元素精准点击（优先元素绝对位置，兜底组件物理坐标）
 async function tryInFrameClick(page) {
-  const fl = page.frameLocator('iframe[src*="challenges.cloudflare.com"]');
+  const fl = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
   const candidates = [
-    fl.getByRole('checkbox'),
+    fl.locator('label.cb-lb'),
     fl.locator('input[type="checkbox"]'),
+    fl.locator('.ctp-checkbox-label'),
+    fl.getByRole('checkbox'),
     fl.locator('label'),
+    fl.locator('#challenge-stage')
   ];
+
   for (const loc of candidates) {
     try {
       const first = loc.first();
       if ((await first.count().catch(() => 0)) > 0) {
-        await first.click({ timeout: 6000 });
-        console.log('[turnstile] in-frame element click performed');
-        return true;
+        await first.scrollIntoViewIfNeeded().catch(() => {});
+        const box = await first.boundingBox().catch(() => null);
+        if (box && box.width > 0 && box.height > 0) {
+          const cx = Math.round(box.x + Math.min(14, box.width / 4));
+          const cy = Math.round(box.y + box.height / 2);
+          await page.mouse.move(cx - 30, cy - 15, { steps: 6 });
+          await sleep(100);
+          await page.mouse.move(cx, cy, { steps: 8 });
+          await sleep(150);
+          await page.mouse.down();
+          await sleep(80);
+          await page.mouse.up();
+          console.log(`[turnstile] native mouse click performed on element at cx=${cx} cy=${cy}`);
+          await first.click({ timeout: 2000, force: true }).catch(() => {});
+          return true;
+        } else {
+          await first.click({ timeout: 4000, force: true });
+          console.log('[turnstile] in-frame element click performed');
+          return true;
+        }
       }
     } catch (e) {
       console.log(`[turnstile] in-frame click candidate failed: ${String(e.message).slice(0, 120)}`);
     }
   }
+
+  // 备用：外框推算坐标点击
+  const widget = await getTurnstileWidget(page);
+  if (widget && widget.box) {
+    const cx = Math.round(widget.box.x + 28);
+    const cy = Math.round(widget.box.y + Math.min(32, widget.box.height / 2));
+    await page.mouse.move(cx - 30, cy - 15, { steps: 6 });
+    await sleep(100);
+    await page.mouse.move(cx, cy, { steps: 8 });
+    await sleep(150);
+    await page.mouse.down();
+    await sleep(80);
+    await page.mouse.up();
+    console.log(`[turnstile] fallback widget coordinate click performed at cx=${cx} cy=${cy}`);
+    return true;
+  }
+
   return false;
 }
 
-// 在点击坐标处画一个红色标记点并截图（诊断点击到底落在哪）
-async function markClickPoint(page, x, y, name) {
-  await page.evaluate(({ x, y }) => {
-    const d = document.createElement('div');
-    d.id = '__click_marker';
-    d.style.cssText = `position:fixed;left:${x - 9}px;top:${y - 9}px;width:18px;height:18px;border:3px solid red;border-radius:50%;z-index:2147483647;pointer-events:none;background:rgba(255,0,0,0.25)`;
-    document.body.appendChild(d);
-  }, { x, y }).catch(() => {});
-  await takeScreenshot(page, name);
-  await page.evaluate(() => document.getElementById('__click_marker')?.remove()).catch(() => {});
-}
-
-// 读挑战 iframe 内部文本（组件真实状态：未勾选 / 验证中 / 失败原因）
+// 读挑战 iframe 内部文本（穿透 Shadow DOM）
 async function challengeFrameText(page) {
   for (const frame of page.frames()) {
     if (frame.url().includes('challenges.cloudflare.com')) {
-      const t = await frame.evaluate(() => (document.body?.innerText || '').replace(/\s+/g, ' ').slice(0, 140)).catch(() => null);
-      if (t) return t;
+      const t = await frame.evaluate(() => {
+        const extractText = (root) => {
+          if (!root) return '';
+          let str = '';
+          for (const node of root.childNodes) {
+            if (node.nodeType === Node.TEXT_NODE) str += ' ' + node.textContent;
+            if (node.nodeType === Node.ELEMENT_NODE) {
+              if (node.shadowRoot) str += ' ' + extractText(node.shadowRoot);
+              str += ' ' + extractText(node);
+            }
+          }
+          return str;
+        };
+        const res = extractText(document.body);
+        return res.replace(/\s+/g, ' ').trim().slice(0, 140);
+      }).catch(() => null);
+      if (t && t.length > 0) return t;
     }
   }
   return null;
 }
 
-// 关闭 Google 插页广告（vignette）：优先点它自带的 Close/dismiss 控件，其次 Esc。
+// 关闭 Google 插页广告
 async function closeVignette(page) {
   const selectors = [
     '#dismiss-button',
@@ -580,7 +661,6 @@ async function closeVignette(page) {
       }
     } catch {}
   }
-  // 兜底：右上角区域的 "Close" 文本控件
   try {
     const loc = page.locator('text=/^Close$/').first();
     if ((await loc.count().catch(() => 0)) > 0 && await loc.isVisible().catch(() => false)) {
@@ -594,74 +674,35 @@ async function closeVignette(page) {
   return false;
 }
 
-// 清除全屏广告层（插页 iframe 及其遮罩容器），并检测页面是否已被广告带离站点
-async function sweepFullscreenAds(page) {
-  const removed = await page.evaluate(() => {
-    let n = 0;
-    const vw = window.innerWidth, vh = window.innerHeight;
-    for (const el of Array.from(document.querySelectorAll('iframe, div'))) {
-      const r = el.getBoundingClientRect();
-      if (r.width >= vw * 0.95 && r.height >= vh * 0.95) {
-        const id = el.id || '';
-        const src = el.tagName === 'IFRAME' ? (el.getAttribute('src') || '') : '';
-        const hasAdFrame = !!el.querySelector?.('iframe[id*="google_ads"], iframe[src*="googlesyndication"], iframe[src*="doubleclick"]');
-        if (id.includes('google_ads') || src.includes('googlesyndication') || src.includes('doubleclick') || hasAdFrame) {
-          el.remove();
-          n++;
-        }
-      }
-    }
-    return n;
-  }).catch(() => 0);
-  if (removed > 0) console.log(`[ads] swept ${removed} fullscreen ad layer(s)`);
-  return removed;
-}
-
-async function ensureOnSite(page) {
-  if (!page.url().includes('axenthost.com')) {
-    console.log(`[ads] page navigated away to ${page.url().slice(0, 80)}, returning to claim page...`);
-    await page.goto(CLAIM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
-    await sleep(3000);
-    await dismissAdModals(page);
-    return false;
-  }
-  return true;
-}
-
-// Turnstile 求解 v18（2026-11-06）：
-// 本地 A/B 实测（同会话、同出口、同浏览器）：
-//   probeA（仅隐藏 webdriver，不动 DOM、不点）→ 43 秒隐形通过发 token；
-//   probeB（probeA + 指纹补丁）→ 43 秒时框翻成 300×65 互动模式，90 秒无 token。
-// 结论：指纹补丁本身就是触发互动模式的毒药（已在 buildContext 里删掉）。
-// 求解按 Heisi 定的逻辑：先被动等 token；框真渲染出内容（复选框）才点，
-// 点的是帧内元素本身；框是空的绝不盲点坐标——直接刷新换一个新挑战。
+// Turnstile 求解核心（修复 Shadow DOM 盲区与空组件死锁）
 async function waitAndSolveTurnstile(page, attemptIndex) {
   lastTurnstileInvisible = false;
   console.log('[turnstile] waiting for verification (passive first)...');
   const startedAt = Date.now();
   const waitedSec = () => Math.round((Date.now() - startedAt) / 1000);
 
-  // 阶段 1：被动等 token（最长 120 秒）。期间不改 DOM、不点、不清广告——
-  // probeA 证明静等就能过；任何页面改动都可能抬高风控。
-  for (let i = 0; i < 60; i++) {
+  // 阶段 1：被动等 token（最长等待 46 秒）
+  for (let i = 0; i < 23; i++) {
     if (await checkTurnstilePassed(page)) {
       console.log(`[turnstile] passed passively (${waitedSec()}s)`);
       await takeScreenshot(page, `attempt${attemptIndex}-turnstile-passed`);
       return true;
     }
     if (await checkTurnstileFailed(page)) break;
-    if (i % 5 === 0) console.log(`[turnstile] securing waited ${waitedSec()}s`);
+    if (i % 4 === 0) console.log(`[turnstile] securing waited ${waitedSec()}s`);
     await sleep(2000);
   }
 
-  // 阶段 2：框已渲染出内容（真复选框）→ 帧内元素点击，等绿勾。
+  // 阶段 2：直接探查复选框组件（穿透 Shadow DOM，废除脆弱的空文本拦截）
+  const { rendered } = await checkChallengeRendered(page);
   const frameText = await challengeFrameText(page);
-  if (frameText) {
-    console.log(`[turnstile] widget rendered (${JSON.stringify(frameText.slice(0, 80))}), clicking checkbox...`);
+
+  if (rendered || frameText) {
+    console.log(`[turnstile] widget element confirmed (${JSON.stringify((frameText || 'rendered').slice(0, 60))}), clicking checkbox...`);
     await dumpChallengeFrames(page, `a${attemptIndex}`);
     const clicked = await tryInFrameClick(page);
     if (clicked) {
-      for (let i = 0; i < 30; i++) {
+      for (let i = 0; i < 20; i++) {
         if (await checkTurnstilePassed(page)) {
           console.log(`[turnstile] passed after click (${waitedSec()}s)`);
           await takeScreenshot(page, `attempt${attemptIndex}-turnstile-passed`);
@@ -671,15 +712,15 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
         await sleep(2000);
       }
     } else {
-      console.log('[turnstile] no clickable checkbox element in frame');
+      console.log('[turnstile] click dispatch returned false');
     }
   } else {
-    // 框是空的：刷新换一个新挑战，再被动等 60 秒，绝不盲点坐标。
+    // 只有在 iframe 与容器确实皆未渲染时才触发 reload
     lastTurnstileInvisible = true;
-    console.log('[turnstile] challenge frame empty, reloading for a fresh challenge (no blind click)...');
+    console.log('[turnstile] challenge frame truly empty, reloading once...');
     await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
     await sleep(3500);
-    for (let i = 0; i < 30; i++) {
+    for (let i = 0; i < 15; i++) {
       if (await checkTurnstilePassed(page)) {
         console.log(`[turnstile] passed after reload (${waitedSec()}s)`);
         await takeScreenshot(page, `attempt${attemptIndex}-turnstile-passed`);
@@ -695,7 +736,7 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
   return false;
 }
 
-// 拟人停留：随机轨迹移动鼠标 + 小幅滚动，产生真实会话的行为信号
+// 拟人停留
 async function humanDwell(page, totalMs) {
   const steps = Math.max(2, Math.floor(totalMs / 2500));
   for (let i = 0; i < steps; i++) {
@@ -707,9 +748,7 @@ async function humanDwell(page, totalMs) {
   }
 }
 
-// v9：等领取页 UI 真正渲染出来（领取按钮 / 验证组件容器 / 挑战 iframe 任一出现）。
-// #792 实证：页面正文一直停在 "Loading..."，验证组件根本没被创建——
-// 旧流程在空白页上等 Turnstile 出现，等多久都不会有。
+// 等待领取页 UI 真实渲染（优化超时，避免在卡死的骨架屏上等待耗满）
 async function waitForClaimUi(page, timeoutSec, tag) {
   const start = Date.now();
   let poll = 0;
@@ -729,8 +768,8 @@ async function waitForClaimUi(page, timeoutSec, tag) {
       console.log(`[load:${tag}] claim UI ready ${JSON.stringify(st)}`);
       return true;
     }
-    if (st && poll % 6 === 1) console.log(`[load:${tag}] waiting UI ${JSON.stringify(st)}`);
-    await sleep(5000);
+    if (st && poll % 4 === 1) console.log(`[load:${tag}] waiting UI ${JSON.stringify(st)}`);
+    await sleep(4000);
   }
   console.log(`[load:${tag}] claim UI not ready after ${timeoutSec}s`);
   return false;
@@ -757,14 +796,12 @@ async function claimOnce(context, attemptIndex) {
   page.on('pageerror', (err) => console.log(`[pageerror] ${String(err.message).slice(0, 160)}`));
 
   try {
-    // v8 预热：先落站点首页拟人停留，再进领取页，而不是新会话第一跳直冲 /claim
     await page.goto('https://app.axenthost.com/', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
-    await humanDwell(page, 9000);
+    await humanDwell(page, 7000);
     await ensureOnClaimPage(page);
     await sleep(2000);
     await dismissAdModals(page);
 
-    // v8 诊断：Turnstile 在页面上的真实存在形态（api 是否加载、容器、iframe 列表）
     const diag = await page.evaluate(() => ({
       turnstileApi: typeof window.turnstile,
       widgetDivs: document.querySelectorAll('.cf-turnstile, [data-sitekey]').length,
@@ -772,70 +809,34 @@ async function claimOnce(context, attemptIndex) {
     })).catch(() => null);
     if (diag) console.log(`[diag] turnstileApi=${diag.turnstileApi} widgetDivs=${diag.widgetDivs} iframes=${JSON.stringify(diag.iframes)}`);
 
-    // v14 诊断（2026-11-06）：把页面实际看到的浏览器环境一次性打全——UA、平台、
-    // WebGL 渲染器（页面视角，已含 init script 补丁后的值）、时区、语言、存储键名。
-    // #835 起在无任何代码变更下由全过变全挂，环境侧必须先有可比对的实测数据再动手。
-    // 只打名称/公开属性，绝不打 cookie 值与存储值。
-    const envDiag = await page.evaluate(() => {
-      let gl = null;
-      try {
-        const c = document.createElement('canvas');
-        const g = c.getContext('webgl') || c.getContext('experimental-webgl');
-        if (g) {
-          const ext = g.getExtension('WEBGL_debug_renderer_info');
-          gl = ext ? String(g.getParameter(ext.UNMASKED_RENDERER_WEBGL)) : String(g.getParameter(g.RENDERER));
-        }
-      } catch (e) { gl = 'err:' + e.message; }
-      return {
-        ua: navigator.userAgent,
-        platform: navigator.platform,
-        uaDataPlatform: (navigator.userAgentData && navigator.userAgentData.platform) || null,
-        lang: navigator.language,
-        tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
-        tzOffsetMin: new Date().getTimezoneOffset(),
-        screen: `${screen.width}x${screen.height}@${window.devicePixelRatio}`,
-        cores: navigator.hardwareConcurrency,
-        gl,
-        lsKeys: Object.keys(localStorage),
-      };
-    }).catch((e) => ({ err: e.message }));
-    console.log(`[env] ${JSON.stringify(envDiag)}`);
-    const cookieNames = (await context.cookies('https://app.axenthost.com').catch(() => []))
-      .map((c) => `${c.name}@${c.domain}`);
-    console.log(`[env] cookies(${cookieNames.length}): ${JSON.stringify(cookieNames)}`);
-
-    // v9：先确认领取页 UI 真的渲染完，再进入验证码流程；在 "Loading..." 空白页上等组件是无用功。
-    // 直连等 90s → 刷新再等 90s → 资源计时定因 + 改走 /servers 后 SPA 内导航到领取。
-    let uiReady = await waitForClaimUi(page, 90, 'direct');
+    // UI 就绪性判断（由 90s 精简为 35s，避免卡死空耗预算）
+    let uiReady = await waitForClaimUi(page, 35, 'direct');
     if (!uiReady) {
       const resTail = await page.evaluate(() => performance.getEntriesByType('resource').slice(-25).map((e) => `${e.name.slice(0, 80)} dur=${Math.round(e.duration)} end=${Math.round(e.responseEnd)}`)).catch(() => []);
       console.log(`[load] resource timing tail: ${JSON.stringify(resTail)}`);
       await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
       await sleep(3000);
       await dismissAdModals(page);
-      uiReady = await waitForClaimUi(page, 90, 'reload');
+      uiReady = await waitForClaimUi(page, 35, 'reload');
     }
     if (!uiReady) {
       console.log('[load] falling back to /servers then in-app navigation to claim...');
       await page.goto('https://app.axenthost.com/servers', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
-      await sleep(5000);
+      await sleep(4000);
       const creditsBtn = page.locator('a[href*="credits"], a:has-text("Credits")').first();
       if (await creditsBtn.isVisible().catch(() => false)) {
         await creditsBtn.click().catch(() => {});
-        await sleep(4000);
+        await sleep(3500);
       }
       const claimEntry = page.locator('button:has-text("Claim free credits"), a:has-text("Claim free credits")').first();
       if (await claimEntry.isVisible().catch(() => false)) {
         await claimEntry.click().catch(() => {});
-        await sleep(4000);
+        await sleep(3500);
       }
-      uiReady = await waitForClaimUi(page, 60, 'spa-nav');
+      uiReady = await waitForClaimUi(page, 45, 'spa-nav');
       console.log(`[load] spa-nav result: uiReady=${uiReady} url=${page.url()}`);
     }
 
-    // v10：UI 始终不渲染且 API 连续 401 = 存储的会话令牌已失效（#793 实证：
-    // /v5/users/infos、/v5/servers 等全部 401，页面永远停在 Loading）。
-    // 这种情况继续等 Turnstile 毫无意义，立刻以明确原因失败，等 secrets 刷新。
     if (!uiReady && api401Count >= 3) {
       console.log(`[auth] claim UI never rendered and API returned 401 x${api401Count} — stored session token expired/invalid, secrets need a fresh login export`);
       await takeScreenshot(page, `attempt${attemptIndex}-session-expired`);
@@ -852,10 +853,8 @@ async function claimOnce(context, attemptIndex) {
       return { ok: false, reason: 'cookies-expired-or-not-logged-in' };
     }
 
-    // 登录有效，安全导出最新凭据
     await exportFreshState(context, page);
 
-    // 读取可用状态与冷却时间
     const availability = await page.evaluate(() => {
       try {
         const text = document.body.innerText;
@@ -872,10 +871,6 @@ async function claimOnce(context, attemptIndex) {
     });
 
     console.log(`[claim] remaining claims: ${availability.remaining === null ? 'unknown' : availability.remaining}`);
-    if (availability.remaining === null) {
-      const sample = await page.evaluate(() => (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 260)).catch(() => '');
-      console.log(`[claim] page text sample: ${sample}`);
-    }
 
     if (availability.remaining === 0 || (availability.remaining === null && availability.refill && !/Ready/i.test(availability.refill))) {
       console.log(`[claim] currently in cooldown: ${availability.refill || 'unknown'}`);
@@ -886,7 +881,7 @@ async function claimOnce(context, attemptIndex) {
     // 执行验证码求解
     await waitAndSolveTurnstile(page, attemptIndex);
 
-    // 严谨等待按钮就绪
+    // 等待按钮解锁
     const isEnabled = await page.waitForFunction(() => {
       const isSecuring = document.body.innerText.includes('Securing your claim');
       const btn = Array.from(document.querySelectorAll('button')).find((b) =>
@@ -946,7 +941,6 @@ async function claimOnce(context, attemptIndex) {
   }
 }
 
-// 浏览器启动（优先系统 Chrome，失败回退内置 Chromium）
 async function launchBrowser() {
   const launchOpts = {
     headless: false,
@@ -976,7 +970,6 @@ async function launchBrowser() {
   return browser;
 }
 
-// 构建带指纹伪装与登录凭据注入的浏览器上下文
 async function buildContext(browser) {
   const geo = await detectEgressGeo();
   const context = await browser.newContext({
@@ -985,15 +978,6 @@ async function buildContext(browser) {
     timezoneId: geo.timezone || 'America/New_York',
   });
 
-  // 注意：本站有广告拦截墙——拦截广告请求会整页替换成 Ad Blocker 提示（#743 实证），
-  // 因此绝不能在网络层拦广告；插页广告只能在页面内关闭/清扫（见 closeVignette）。
-
-  // v18（2026-11-06）：只留 webdriver 隐藏，其他指纹补丁全删。
-  // 本地 A/B 实测（同会话、同 hnhost 出口、同 bundled Chromium 158）：
-  //   probeA（仅本行补丁，不动 DOM、不点击）→ 43 秒隐形通过，token 到手；
-  //   probeB（probeA + 下面这批补丁）→ 43 秒时框翻成 300×65 互动模式，90 秒无 token。
-  // window.chrome / languages / plugins / hardwareConcurrency / deviceMemory
-  // 这些补丁就是把 CF 从隐形模式逼成互动模式的毒药——删掉，不要再加回来。
   await context.addInitScript(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
   });
@@ -1004,9 +988,6 @@ async function buildContext(browser) {
       const storage = JSON.parse(unpackSecretValue(AXENT_LOCAL_STORAGE));
       await context.addInitScript((items) => {
         for (const [k, v] of Object.entries(items)) {
-          // v22：auth 键只在缺失时注入。本轮内 OAuth 重登会把新鲜 auth 写进
-          // 本源 localStorage，后续新页面若再用 secret 里的旧值覆盖，刚换的
-          // 令牌立刻被打回过期状态。
           if (k === 'auth' && window.localStorage.getItem('auth')) continue;
           window.localStorage.setItem(k, v);
         }
@@ -1020,8 +1001,6 @@ async function buildContext(browser) {
   if (AXENT_COOKIES) {
     try {
       const parsed = JSON.parse(AXENT_COOKIES);
-      // v13: 注入侧同步过滤存量 CF cookie——当前 secret 里还存着旧逻辑回写的
-      // cloudflare 域 cookie，不在注入侧拦掉的话，导出侧的修复要等一整轮才生效。
       const cfCookieName = /^(cf_clearance|__cf_bm|__cflb|__cfruid|cf_chl_|cf_ob_|cf_use_ob)/;
       const kept = parsed.filter((item) => {
         const host = (item.domain || '').replace(/^\./, '').toLowerCase();
@@ -1067,9 +1046,6 @@ async function buildContext(browser) {
   let failures = 0;
   let waitedShortCooldown = false;
 
-  // v22：开跑前先看令牌余命。剩余 <90 分钟（或已过期/解析不出）且 Discord
-  // 会话可用时，先 OAuth 重登换新令牌再领取——避免像 2026-11-08 22:00 那轮
-  // 领到一半跨过到期点被 401 打断。Discord 未配置时完全跳过，行为同旧版。
   const discordConfigured = !!(DISCORD_COOKIES || DISCORD_LOCAL_STORAGE);
   if (discordConfigured) {
     const exp = storedAuthExpiresAt();
@@ -1086,10 +1062,6 @@ async function buildContext(browser) {
   }
 
   for (let attemptNo = 1; ; attemptNo++) {
-    // v12: 预算检查前移到尝试开始之前。#838 实证：旧逻辑只在失败后查 22 分钟预算，
-    // 第 4 次尝试在第 18 分钟启动、单次最长 ~6 分钟，叠加 job 前段 ~5 分钟开销后
-    // 撞穿 30 分钟 job 上限被强杀，连 FINAL 都没打出来。预算 12 分钟 + 开始前检查，
-    // 保证脚本永远在 job 上限内自己收尾。
     if (attemptNo > 1 && Date.now() - runStartedAt > 12 * 60 * 1000) {
       console.log('[run] time budget (12min) exhausted before new attempt, stopping cleanly');
       break;
@@ -1121,11 +1093,7 @@ async function buildContext(browser) {
     }
 
     failures++;
-    // v11: 不可见挑战改为可重试（见下方 #809 实证说明）；401 过期仍立即停，
-    // 因为换会话也救不了死令牌，必须等新导出。
     if (result.reason === 'session-expired-api-401') {
-      // v22：Discord 会话可用且本轮还没试过重登时，先 OAuth 换新令牌再继续，
-      // 救回这一整点轮；重登失败或未配置 Discord 时维持旧行为（停轮等处理）。
       if (discordConfigured && !reloginTried) {
         reloginTried = true;
         console.log('[relogin] 401 mid-run — attempting Discord OAuth relogin once');
@@ -1142,22 +1110,15 @@ async function buildContext(browser) {
       break;
     }
     if (result.invisibleChallenge) {
-      // v11: 不再快速失败。#809 实证：同一轮里第 1 次领取点选后通过（175s）、
-      // 第 2 次才撞上不可见挑战——不可见是按挑战实例随机的，换新会话/新页面
-      // 重试有真实通过率。落入下方验证失败分支：重启浏览器换新会话再试，
-      // 由 failures 上限和时间预算收口。
-      console.log('[run] invisible challenge on this attempt; treating as retryable verification failure (fresh session, per #809 evidence)');
+      console.log('[run] invisible challenge on this attempt; treating as retryable verification failure');
     }
     if (Date.now() - runStartedAt > 12 * 60 * 1000) {
       console.log('[run] time budget (12min) exhausted, stopping before job timeout');
       break;
     }
     if (failures >= MAX_ATTEMPTS) break;
-    // 验证类失败说明当前会话已被风控标记，整浏览器重启换新会话再试，
-    // 不要在同一个会话里反复撞墙
+
     if ((result.reason === 'button-disabled-verification-failed' || result.reason === 'unknown-result') && freshAuthJson) {
-      // v22：本轮刚 OAuth 换过令牌时绝不重建上下文——重建会用 env 里的旧
-      // auth 覆盖新令牌。同上下文稍等重试即可，收尾回写另有 freshAuthJson 兜底。
       console.log('[run] verification failed after relogin; keeping current context to protect the fresh token');
       await sleep(7000);
       continue;
@@ -1165,7 +1126,6 @@ async function buildContext(browser) {
     if (result.reason === 'button-disabled-verification-failed' || result.reason === 'unknown-result') {
       console.log('[run] verification failed, relaunching browser with a fresh session...');
       await browser.close().catch(() => {});
-      // v12: 重启前冷却 60s（旧 5s），避免同轮内高频连撞挑战继续喂高风控分
       await sleep(60000);
       browser = await launchBrowser();
       context = await buildContext(browser);
@@ -1176,9 +1136,7 @@ async function buildContext(browser) {
 
   console.log(`[claim] total claimed this run: ${claimedCount}`);
 
-  // 收尾保底回写：只要会话里还有 auth 凭据就同步一次，避免 secret 断更
   await exportFreshState(context, null).catch(() => {});
-
   await browser.close();
   console.log('FINAL:', JSON.stringify(result));
 
