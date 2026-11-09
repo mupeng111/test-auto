@@ -102,6 +102,8 @@ jobs:
         env:
           AXENT_COOKIES: ${{ secrets.AXENT_COOKIES }}
           AXENT_LOCAL_STORAGE: ${{ secrets.AXENT_LOCAL_STORAGE }}
+          DISCORD_COOKIES: ${{ secrets.DISCORD_COOKIES }}
+          DISCORD_LOCAL_STORAGE: ${{ secrets.DISCORD_LOCAL_STORAGE }}
           PROXY_SERVER: ${{ env.PROXY_SERVER }}
         run: |
           if ! command -v xvfb-run >/dev/null 2>&1; then
@@ -137,8 +139,26 @@ jobs:
               echo "::warning::failed to refresh AXENT_LOCAL_STORAGE"
             fi
           fi
-          rm -f fresh-cookies.json fresh-localstorage.json
-          echo "Refresh summary: AXENT_COOKIES=$COOKIE_STATUS, AXENT_LOCAL_STORAGE=$STORAGE_STATUS"
+          DISCORD_COOKIE_STATUS="skipped (no file)"
+          DISCORD_STORAGE_STATUS="skipped (no file)"
+          if [ -f fresh-discord-cookies.json ]; then
+            if gh secret set DISCORD_COOKIES --repo ${{ github.repository }} < fresh-discord-cookies.json; then
+              DISCORD_COOKIE_STATUS="updated"
+            else
+              DISCORD_COOKIE_STATUS="FAILED"
+              echo "::warning::failed to refresh DISCORD_COOKIES"
+            fi
+          fi
+          if [ -f fresh-discord-localstorage.json ]; then
+            if gh secret set DISCORD_LOCAL_STORAGE --repo ${{ github.repository }} < fresh-discord-localstorage.json; then
+              DISCORD_STORAGE_STATUS="updated"
+            else
+              DISCORD_STORAGE_STATUS="FAILED"
+              echo "::warning::failed to refresh DISCORD_LOCAL_STORAGE"
+            fi
+          fi
+          rm -f fresh-cookies.json fresh-localstorage.json fresh-discord-cookies.json fresh-discord-localstorage.json
+          echo "Refresh summary: AXENT_COOKIES=$COOKIE_STATUS, AXENT_LOCAL_STORAGE=$STORAGE_STATUS, DISCORD_COOKIES=$DISCORD_COOKIE_STATUS, DISCORD_LOCAL_STORAGE=$DISCORD_STORAGE_STATUS"
 
       - name: 上传异常排查截图制品
         if: always()
