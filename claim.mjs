@@ -230,6 +230,16 @@ async function reloginViaDiscord(context) {
   const page = await context.newPage();
   try {
     await injectDiscordSession(context);
+    // v22.2：先以已登录态进站清掉旧 auth 并立标记，再进 /login。旧 auth 不清，
+    // SPA 会把 /login 重定向回站内（#973 截图：落在 Servers 页、余额 0、Loading），
+    // Discord 按钮永远不出现。标记只在重登页（本标签）生效，不影响后续领取页。
+    await page.goto('https://app.axenthost.com/', { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+    await sleep(2000);
+    await page.evaluate(() => {
+      try { window.sessionStorage.setItem('axent-relogin', '1'); } catch {}
+      try { window.localStorage.removeItem('auth'); } catch {}
+    }).catch(() => {});
+    console.log('[relogin] cleared stored Axent auth for the login page');
     await page.goto('https://app.axenthost.com/login', { waitUntil: 'domcontentloaded', timeout: 60000 });
     await sleep(3000);
     const loginBtn = page.locator('button:has-text("Login with Discord"), a:has-text("Login with Discord")').first();
@@ -1005,6 +1015,11 @@ async function buildContext(browser) {
       await context.addInitScript((items) => {
         for (const [k, v] of Object.entries(items)) {
           if (k === 'auth' && window.localStorage.getItem('auth')) continue;
+          // v22.2：重登页用 sessionStorage 标记跳过注入，否则 /login 会因旧 auth
+          // 被 SPA 重定向回站内，Discord 按钮永远不出现（#973 截图实证）。
+          if (k === 'auth') {
+            try { if (window.sessionStorage.getItem('axent-relogin')) continue; } catch {}
+          }
           window.localStorage.setItem(k, v);
         }
       }, storage);
