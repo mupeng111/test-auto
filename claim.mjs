@@ -75,27 +75,90 @@ async function takeScreenshot(page, name) {
   }
 }
 
-// 模拟 ESC，清理遮挡弹窗/广告
+// 关闭 Google 插页广告（vignette）
+async function closeVignette(page) {
+  const selectors = [
+    '#dismiss-button',
+    '[id*="dismiss-button"]',
+    'div[aria-label="Close ad"]',
+    '[aria-label="Close ad"]',
+    '.google-ad-close',
+  ];
+  for (const sel of selectors) {
+    try {
+      const loc = page.locator(sel).first();
+      if ((await loc.count().catch(() => 0)) > 0 && await loc.isVisible().catch(() => false)) {
+        await loc.click({ timeout: 2000, force: true }).catch(() => {});
+        console.log(`[ads] vignette closed via ${sel}`);
+        await sleep(500);
+        return true;
+      }
+    } catch {}
+  }
+  try {
+    const loc = page.locator('text=/^Close$/').first();
+    if ((await loc.count().catch(() => 0)) > 0 && await loc.isVisible().catch(() => false)) {
+      await loc.click({ timeout: 2000, force: true }).catch(() => {});
+      console.log('[ads] vignette closed via Close text');
+      await sleep(500);
+      return true;
+    }
+  } catch {}
+  return false;
+}
+
+// 清除全屏广告层
+async function sweepFullscreenAds(page) {
+  try {
+    return await page.evaluate(() => {
+      let n = 0;
+      const vw = window.innerWidth, vh = window.innerHeight;
+      for (const el of Array.from(document.querySelectorAll('iframe, div, ins.adsbygoogle'))) {
+        const r = el.getBoundingClientRect();
+        const id = el.id || '';
+        const src = el.tagName === 'IFRAME' ? (el.getAttribute('src') || '') : '';
+        const isAd = id.includes('aswift') || id.includes('google_ads') || src.includes('google') || src.includes('doubleclick') || el.classList.contains('adsbygoogle');
+        if (isAd && (r.width >= vw * 0.8 || r.height >= vh * 0.8 || id.includes('vignette'))) {
+          el.remove();
+          n++;
+        }
+      }
+      document.body.style.overflow = 'auto';
+      return n;
+    }).catch(() => 0);
+  } catch {
+    return 0;
+  }
+}
+
+// 模拟 ESC，强力粉碎包括 Google Vignette 全屏遮罩在内的所有广告阻碍
 async function dismissAdModals(page) {
   try {
+    // 1. 如果被 Google 插页广告带偏了 URL hash，清洗并恢复路由
+    if (page.url().includes('#google_vignette')) {
+      console.log('[ads] detected #google_vignette overlay, sweeping and recovering...');
+      await closeVignette(page);
+      await sweepFullscreenAds(page);
+      await page.keyboard.press('Escape');
+      // 强行把页面 hash 抹去，恢复 SPA 路由状态
+      await page.evaluate(() => {
+        if (window.location.hash.includes('google_vignette')) {
+          history.replaceState(null, '', window.location.pathname);
+        }
+      }).catch(() => {});
+      await sleep(1000);
+    }
+
+    // 2. 尝试关闭普通弹窗广告
+    await closeVignette(page);
     await page.keyboard.press('Escape');
     const closeBtn = page.locator('button:has-text("Close"), text=/^Close$/i, [aria-label="Close"]').first();
     if (await closeBtn.isVisible().catch(() => false)) {
       await closeBtn.click({ force: true, timeout: 1500 }).catch(() => {});
     }
-    await page.evaluate(() => {
-      const all = Array.from(document.querySelectorAll('body *'));
-      for (const el of all) {
-        const s = window.getComputedStyle(el);
-        if ((s.position === 'fixed' || s.position === 'sticky') && parseInt(s.zIndex || '0', 10) >= 100) {
-          const hasAdFrame = !!el.querySelector('iframe[src*="google"], iframe[id*="google_ads"], iframe[src*="ads"], iframe[src*="doubleclick"]');
-          if (hasAdFrame) {
-            const c = el.querySelector('[aria-label*="close" i], button[class*="close" i], [class*="close-btn" i]');
-            if (c) c.click();
-          }
-        }
-      }
-    }).catch(() => {});
+
+    // 3. 清理全屏遮罩
+    await sweepFullscreenAds(page);
   } catch {}
 }
 
@@ -343,7 +406,7 @@ async function exportFreshState(context, page) {
   return false;
 }
 
-// 确保页面停留在真实的领取页
+// 确保页面停留在真实的领取页（彻底粉碎 #google_vignette 阻碍）
 async function ensureOnClaimPage(page) {
   const isDirectlyReady = async () => {
     try {
@@ -356,15 +419,17 @@ async function ensureOnClaimPage(page) {
     }
   };
 
-  if (!page.url().includes('/claim')) {
+  // 1. 如果当前路由不在 /claim，或者被插页广告污染带了 hash，直接强制导航
+  if (!page.url().includes('/claim') || page.url().includes('#google_vignette')) {
     console.log('[nav] navigating directly to /claim...');
     await page.goto(CLAIM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
     await sleep(2500);
     await dismissAdModals(page);
   }
 
+  // 2. 只要处于 /claim 路径，耐心等待组件渲染，杜绝跳出
   if (page.url().includes('/claim')) {
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; i < 10; i++) {
       if (await isDirectlyReady()) {
         console.log('[nav] /claim elements loaded successfully');
         return true;
@@ -373,6 +438,7 @@ async function ensureOnClaimPage(page) {
     }
   }
 
+  // 3. 只有明确被后端重定向到了 /servers，才点击侧边栏 Credits 纠偏
   if (page.url().includes('/servers')) {
     console.log('[nav] redirected to /servers, clicking sidebar Credits...');
     const creditsSidebarBtn = page.locator('a[href*="credits"], a:has-text("Credits")').first();
@@ -383,6 +449,7 @@ async function ensureOnClaimPage(page) {
     }
   }
 
+  // 4. 若停留在 /credits 汇总页，点击黄色的 Claim free credits 进入真实领取页
   if (page.url().includes('/credits') && !page.url().includes('/claim')) {
     console.log('[nav] on /credits summary, clicking "Claim free credits" button...');
     const claimEntryBtn = page.locator('button:has-text("Claim free credits"), a:has-text("Claim free credits")').first();
@@ -401,7 +468,7 @@ async function ensureOnClaimPage(page) {
   return await isDirectlyReady();
 }
 
-// 校验 Turnstile 是否真正放行（支持穿透 Shadow DOM 读取组件内成功提示）
+// 校验 Turnstile 是否真正放行
 async function checkTurnstilePassed(page) {
   try {
     const main = await page.evaluate(() => {
@@ -456,7 +523,7 @@ async function checkTurnstilePassed(page) {
   }
 }
 
-// 检测 Turnstile 是否明确判定失败（穿透 Shadow DOM）
+// 检测 Turnstile 是否明确判定失败
 async function checkTurnstileFailed(page) {
   try {
     const cfFrame = page.frames().find((f) => f.url().includes('challenges.cloudflare.com'));
@@ -519,7 +586,7 @@ async function dumpChallengeFrames(page, tag) {
   }
 }
 
-// 检查挑战组件是否已挂载到 DOM 中（穿透 Shadow DOM）
+// 检查挑战组件是否已挂载到 DOM 中
 async function checkChallengeRendered(page) {
   try {
     const fl = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
@@ -546,7 +613,7 @@ async function checkChallengeRendered(page) {
   return { rendered: false, target: null };
 }
 
-// 帧内元素精准点击（优先元素绝对位置，兜底组件物理坐标）
+// 帧内元素精准点击
 async function tryInFrameClick(page) {
   const fl = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
   const candidates = [
@@ -606,7 +673,7 @@ async function tryInFrameClick(page) {
   return false;
 }
 
-// 读挑战 iframe 内部文本（穿透 Shadow DOM）
+// 读挑战 iframe 内部文本
 async function challengeFrameText(page) {
   for (const frame of page.frames()) {
     if (frame.url().includes('challenges.cloudflare.com')) {
@@ -632,40 +699,7 @@ async function challengeFrameText(page) {
   return null;
 }
 
-// 关闭 Google 插页广告
-async function closeVignette(page) {
-  const selectors = [
-    '#dismiss-button',
-    '[id*="dismiss-button"]',
-    'div[aria-label="Close ad"]',
-    '[aria-label="Close ad"]',
-    '.google-ad-close',
-  ];
-  for (const sel of selectors) {
-    try {
-      const loc = page.locator(sel).first();
-      if ((await loc.count().catch(() => 0)) > 0 && await loc.isVisible().catch(() => false)) {
-        await loc.click({ timeout: 3000 });
-        console.log(`[ads] vignette closed via ${sel}`);
-        await sleep(800);
-        return true;
-      }
-    } catch {}
-  }
-  try {
-    const loc = page.locator('text=/^Close$/').first();
-    if ((await loc.count().catch(() => 0)) > 0 && await loc.isVisible().catch(() => false)) {
-      await loc.click({ timeout: 3000 });
-      console.log('[ads] vignette closed via Close text');
-      await sleep(800);
-      return true;
-    }
-  } catch {}
-  await page.keyboard.press('Escape').catch(() => {});
-  return false;
-}
-
-// Turnstile 求解核心（修复 Shadow DOM 盲区与空组件死锁）
+// Turnstile 求解核心
 async function waitAndSolveTurnstile(page, attemptIndex) {
   lastTurnstileInvisible = false;
   console.log('[turnstile] waiting for verification (passive first)...');
@@ -674,6 +708,9 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
 
   // 阶段 1：被动等 token（最长等待 46 秒）
   for (let i = 0; i < 23; i++) {
+    // 途中定期巡检广告遮罩
+    if (i % 5 === 0) await dismissAdModals(page);
+
     if (await checkTurnstilePassed(page)) {
       console.log(`[turnstile] passed passively (${waitedSec()}s)`);
       await takeScreenshot(page, `attempt${attemptIndex}-turnstile-passed`);
@@ -684,7 +721,7 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
     await sleep(2000);
   }
 
-  // 阶段 2：直接探查复选框组件（穿透 Shadow DOM，废除脆弱的空文本拦截）
+  // 阶段 2：直接探查复选框组件并执行点击
   const { rendered } = await checkChallengeRendered(page);
   const frameText = await challengeFrameText(page);
 
@@ -707,9 +744,11 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
     }
   } else {
     lastTurnstileInvisible = true;
-    console.log('[turnstile] challenge frame truly empty, reloading once...');
+    console.log('[turnstile] challenge frame truly empty, clearing overlays and reloading once...');
+    await dismissAdModals(page);
     await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
     await sleep(3500);
+    await dismissAdModals(page);
     for (let i = 0; i < 15; i++) {
       if (await checkTurnstilePassed(page)) {
         console.log(`[turnstile] passed after reload (${waitedSec()}s)`);
@@ -738,7 +777,7 @@ async function humanDwell(page, totalMs) {
   }
 }
 
-// 等待领取页 UI 真实渲染（压缩超时，避免卡在骨架屏耗尽全局时间）
+// 等待领取页 UI 真实渲染（修复把正常 claim 骨架屏误判为超时的 Bug）
 async function waitForClaimUi(page, timeoutSec, tag) {
   const start = Date.now();
   let poll = 0;
@@ -746,20 +785,27 @@ async function waitForClaimUi(page, timeoutSec, tag) {
     poll++;
     const st = await page.evaluate(() => {
       const text = (document.body.innerText || '').replace(/\s+/g, ' ');
+      const hasClaimText = text.includes('Claim 3') || text.includes('claims per hour') || /\d+\s*\/\s*5\s*claims?/i.test(text);
+      const hasClaimBtn = !!Array.from(document.querySelectorAll('button')).find((b) => b.textContent.includes('Claim 3 credits'));
+      const hasWidget = document.querySelectorAll('.cf-turnstile, [data-sitekey]').length > 0;
+      const hasCfFrame = !!document.querySelector('iframe[src*="challenges.cloudflare.com"]');
       return {
         loading: text.includes('Loading...'),
-        hasClaimBtn: !!Array.from(document.querySelectorAll('button')).find((b) => b.textContent.includes('Claim 3 credits')),
-        hasWidget: document.querySelectorAll('.cf-turnstile, [data-sitekey]').length > 0,
-        hasCfFrame: !!document.querySelector('iframe[src*="challenges.cloudflare.com"]'),
+        hasClaimBtn,
+        hasClaimText,
+        hasWidget,
+        hasCfFrame,
         textLen: text.length,
       };
     }).catch(() => null);
-    if (st && (st.hasClaimBtn || st.hasWidget || st.hasCfFrame)) {
+
+    // 只要有领取文字、按钮或组件，立即认定 UI 已经就绪，绝对不倒退回 /servers
+    if (st && (st.hasClaimBtn || st.hasClaimText || st.hasWidget || st.hasCfFrame)) {
       console.log(`[load:${tag}] claim UI ready ${JSON.stringify(st)}`);
       return true;
     }
     if (st && poll % 4 === 1) console.log(`[load:${tag}] waiting UI ${JSON.stringify(st)}`);
-    await sleep(4000);
+    await sleep(3000);
   }
   console.log(`[load:${tag}] claim UI not ready after ${timeoutSec}s`);
   return false;
@@ -770,7 +816,6 @@ async function claimOnce(context, attemptIndex) {
   const page = await context.newPage();
   let api401Count = 0;
 
-  // 每次打开新页面确保挂载最新的 auth 令牌
   if (freshAuthJson) {
     await page.addInitScript((token) => {
       window.localStorage.setItem('auth', token);
@@ -808,8 +853,6 @@ async function claimOnce(context, attemptIndex) {
 
     let uiReady = await waitForClaimUi(page, 35, 'direct');
     if (!uiReady) {
-      const resTail = await page.evaluate(() => performance.getEntriesByType('resource').slice(-25).map((e) => `${e.name.slice(0, 80)} dur=${Math.round(e.duration)} end=${Math.round(e.responseEnd)}`)).catch(() => []);
-      console.log(`[load] resource timing tail: ${JSON.stringify(resTail)}`);
       await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
       await sleep(3000);
       await dismissAdModals(page);
@@ -819,15 +862,18 @@ async function claimOnce(context, attemptIndex) {
       console.log('[load] falling back to /servers then in-app navigation to claim...');
       await page.goto('https://app.axenthost.com/servers', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
       await sleep(4000);
+      await dismissAdModals(page);
       const creditsBtn = page.locator('a[href*="credits"], a:has-text("Credits")').first();
       if (await creditsBtn.isVisible().catch(() => false)) {
         await creditsBtn.click().catch(() => {});
         await sleep(3500);
+        await dismissAdModals(page);
       }
       const claimEntry = page.locator('button:has-text("Claim free credits"), a:has-text("Claim free credits")').first();
       if (await claimEntry.isVisible().catch(() => false)) {
         await claimEntry.click().catch(() => {});
         await sleep(3500);
+        await dismissAdModals(page);
       }
       uiReady = await waitForClaimUi(page, 45, 'spa-nav');
       console.log(`[load] spa-nav result: uiReady=${uiReady} url=${page.url()}`);
@@ -1090,7 +1136,6 @@ async function buildContext(browser) {
 
     failures++;
 
-    // 核心修复：同时捕获 401 与 cookies-expired-or-not-logged-in 失效重定向
     const isSessionDead = result.reason === 'session-expired-api-401' || result.reason === 'cookies-expired-or-not-logged-in';
     if (isSessionDead) {
       if (discordConfigured && !reloginTried) {
@@ -1136,7 +1181,6 @@ async function buildContext(browser) {
 
   console.log(`[claim] total claimed this run: ${claimedCount}`);
 
-  // 只有当轮成功，或者成功换取了新 auth 时才最终导出，防止把未登录空会话写回 Secrets
   if (result.ok || freshAuthJson) {
     await exportFreshState(context, null).catch(() => {});
   } else {
