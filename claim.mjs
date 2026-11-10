@@ -242,7 +242,10 @@ async function reloginViaDiscord(context) {
     console.log('[relogin] cleared stored Axent auth for the login page');
     await page.goto('https://app.axenthost.com/login', { waitUntil: 'domcontentloaded', timeout: 60000 });
     await sleep(3000);
-    const loginBtn = page.locator('button:has-text("Login with Discord"), a:has-text("Login with Discord")').first();
+    // v22.3：登录页的按钮文案就是 "Discord"（Apple / Discord / Google 三个并列
+    // 社交按钮），没有 "Login with Discord" 这几个字。旧选择器永远匹配不到，
+    // 导致 #973 与 v22.2 验证轮两次 relogin-button-not-found。
+    const loginBtn = page.locator('button:has-text("Discord")').first();
     if ((await loginBtn.count().catch(() => 0)) === 0) {
       await takeScreenshot(page, 'relogin-no-discord-button');
       return { ok: false, reason: 'relogin-button-not-found' };
