@@ -225,21 +225,23 @@ async function exportDiscordState(context) {
 }
 
 // v22：走 Discord OAuth 换新 24h 令牌
-async function reloginViaDiscord(context) {
+// v22.4：重登在独立上下文（rc）里做，与主领取上下文完全隔离。v22.2 曾在主上下
+// 文里清旧 auth——localStorage 按源共享，清掉后主流程的领取页也会失联（v22.3
+// 验证轮因此 0 领）。独立上下文里没有旧 auth，/login 不会重定向，失败也不伤主会话。
+async function reloginViaDiscord(browser, context) {
   const prevExp = storedAuthExpiresAt() || 0;
-  const page = await context.newPage();
+  const geo = await detectEgressGeo();
+  const rc = await browser.newContext({
+    viewport: { width: 1920, height: 1080 },
+    locale: 'en-US',
+    timezoneId: geo.timezone || 'America/New_York',
+  });
+  await rc.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+  });
+  const page = await rc.newPage();
   try {
-    await injectDiscordSession(context);
-    // v22.2：先以已登录态进站清掉旧 auth 并立标记，再进 /login。旧 auth 不清，
-    // SPA 会把 /login 重定向回站内（#973 截图：落在 Servers 页、余额 0、Loading），
-    // Discord 按钮永远不出现。标记只在重登页（本标签）生效，不影响后续领取页。
-    await page.goto('https://app.axenthost.com/', { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
-    await sleep(2000);
-    await page.evaluate(() => {
-      try { window.sessionStorage.setItem('axent-relogin', '1'); } catch {}
-      try { window.localStorage.removeItem('auth'); } catch {}
-    }).catch(() => {});
-    console.log('[relogin] cleared stored Axent auth for the login page');
+    await injectDiscordSession(rc);
     await page.goto('https://app.axenthost.com/login', { waitUntil: 'domcontentloaded', timeout: 60000 });
     await sleep(3000);
     // v22.3：登录页的按钮文案就是 "Discord"（Apple / Discord / Google 三个并列
@@ -253,6 +255,13 @@ async function reloginViaDiscord(context) {
     await loginBtn.click();
     await page.waitForURL(/discord\.com/, { timeout: 45000 }).catch(() => {});
     await sleep(4000);
+    // 未登录的 Discord 会话会被 Discord 直接送到 /login（而不是授权页），
+    // 按 URL 判定比等表单渲染更可靠（v22.3 验证轮：表单未渲染时误判成
+    // authorize-button-not-found）。
+    if (page.url().includes('/login') && !page.url().includes('/oauth2/authorize')) {
+      await takeScreenshot(page, 'relogin-discord-session-dead');
+      return { ok: false, reason: 'discord-session-expired' };
+    }
     if (page.url().includes('/oauth2/authorize')) {
       const hasLoginForm = (await page.locator('input[name="email"], input[type="email"]').count().catch(() => 0)) > 0;
       if (hasLoginForm) {
@@ -297,7 +306,17 @@ async function reloginViaDiscord(context) {
           if (exp > prevExp + 60000 && exp - Date.now() > 3 * 3600 * 1000) {
             freshAuthJson = authJson;
             console.log(`[relogin] fresh token minted, expiresAt=${a.token.expiresAt}, user=${a?.user?.pseudo || a?.user?.email || '?'}`);
+            // v22.4：新令牌在独立上下文里，先同步进主上下文的共享存储，后续
+            // 领取页才能用上；Axent 状态从主上下文导出，Discord 状态从重登上下文导出。
+            const syncPage = await context.newPage();
+            try {
+              await syncPage.goto('https://app.axenthost.com/', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+              await syncPage.evaluate((auth) => window.localStorage.setItem('auth', auth), freshAuthJson).catch(() => {});
+            } finally {
+              await syncPage.close().catch(() => {});
+            }
             await exportFreshState(context, null).catch(() => {});
+            await exportDiscordState(rc).catch(() => {});
             return { ok: true, expiresAt: a.token.expiresAt };
           }
         } catch {}
@@ -308,7 +327,7 @@ async function reloginViaDiscord(context) {
   } catch (e) {
     return { ok: false, reason: 'relogin-exception', error: e.message };
   } finally {
-    await page.close().catch(() => {});
+    await rc.close().catch(() => {});
   }
 }
 
@@ -1088,7 +1107,7 @@ async function buildContext(browser) {
     if (!exp || msLeft < 90 * 60 * 1000) {
       console.log('[relogin] token expired or <90min left — attempting Discord OAuth relogin before claiming');
       reloginTried = true;
-      const r = await reloginViaDiscord(context);
+      const r = await reloginViaDiscord(browser, context);
       console.log('[relogin] proactive relogin result:', JSON.stringify(r));
     } else {
       console.log(`[relogin] token fresh enough, skipping proactive relogin (will trigger after ${new Date(exp - 90 * 60 * 1000).toISOString()})`);
@@ -1134,7 +1153,7 @@ async function buildContext(browser) {
       if (discordConfigured && !reloginTried) {
         reloginTried = true;
         console.log('[relogin] 401 mid-run — attempting Discord OAuth relogin once');
-        const r = await reloginViaDiscord(context);
+        const r = await reloginViaDiscord(browser, context);
         console.log('[relogin] mid-run relogin result:', JSON.stringify(r));
         if (r.ok) {
           failures = 0;
