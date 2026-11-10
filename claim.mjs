@@ -154,7 +154,11 @@ function storedAuthExpiresAt() {
 async function injectDiscordSession(context) {
   if (DISCORD_LOCAL_STORAGE) {
     try {
-      const storage = JSON.parse(unpackSecretValue(DISCORD_LOCAL_STORAGE));
+      const parsed = JSON.parse(unpackSecretValue(DISCORD_LOCAL_STORAGE));
+      // v22.6：兼容导出文件原格式 {ls, ss, cookie, ts}——直接存整文件时，真正
+      // 的 localStorage 在 ls 里；只按扁平 {key: value} 注入会把 ls 当成一个键，
+      // token 永远进不去（v22.3 轮实证：导出只有 15 字节）。
+      const storage = (parsed && typeof parsed === 'object' && parsed.ls && typeof parsed.ls === 'object') ? parsed.ls : parsed;
       await context.addInitScript((items) => {
         if (!window.location.hostname.endsWith('discord.com')) return;
         for (const [k, v] of Object.entries(items)) {
@@ -169,7 +173,15 @@ async function injectDiscordSession(context) {
   if (DISCORD_COOKIES) {
     try {
       const parsed = JSON.parse(DISCORD_COOKIES);
-      const cookies = parsed
+      // v22.6：同理兼容 {cookie: "a=b; c=d"} 这种导出文件原格式
+      let raw = parsed;
+      if (parsed && !Array.isArray(parsed) && typeof parsed.cookie === 'string') {
+        raw = parsed.cookie.split(';').map((p) => {
+          const i = p.indexOf('=');
+          return i > 0 ? { name: p.slice(0, i).trim(), value: p.slice(i + 1).trim(), domain: '.discord.com', path: '/' } : null;
+        }).filter(Boolean);
+      }
+      const cookies = raw
         .filter((item) => (item.domain || '').replace(/^\./, '').toLowerCase().endsWith('discord.com'))
         .map((item) => ({
           name: item.name,
@@ -195,7 +207,14 @@ async function exportDiscordState(context) {
     const state = await context.storageState();
     const origin = (state.origins || []).find((o) => o.origin === 'https://discord.com');
     const items = origin?.localStorage || [];
-    if (!items.some((i) => (i.name === 'token' || i.name === 'tokens') && i.value)) return false;
+    // v22.6：绝不拿空会话覆盖好 secret。v22.3 轮的回写把 DISCORD secrets 覆
+    // 写成 15 字节的空导出（token 不在 localStorage 里），原会话就此丢失。
+    // 只有拿到像样的 token（≥20 字符）才写文件，否则直接跳过。
+    const tokenItem = items.find((i) => (i.name === 'token' || i.name === 'tokens') && i.value && String(i.value).length >= 20);
+    if (!tokenItem) {
+      console.log('[relogin] refusing to export discord state: no usable token in this context (would overwrite a good secret with an empty one)');
+      return false;
+    }
     const keep = {};
     for (const i of items) {
       if (i.name === 'token' || i.name === 'tokens') keep[i.name] = i.value;
