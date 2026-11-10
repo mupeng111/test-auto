@@ -23,22 +23,13 @@ function unpackSecretValue(str) {
 const PROXY_SERVER = process.env.PROXY_SERVER || '';
 const AXENT_COOKIES = process.env.AXENT_COOKIES || '';
 const AXENT_LOCAL_STORAGE = process.env.AXENT_LOCAL_STORAGE || '';
-// v22（2026-11-09）：自动重登。Axent 令牌 expiresAt 写死登录时刻 +24h、永不顺延、
-// 无 refresh 接口（前端代码实证无任何续期调用），回写只能存同一枚倒计时令牌。
-// 唯一续命 = 重走 Discord OAuth。DISCORD_COOKIES / DISCORD_LOCAL_STORAGE 存在时，
-// 令牌剩余 <90 分钟或中途 401 就自动 OAuth 重登换新令牌；两个 secret 都缺失时
-// 行为与 v21 逐字节一致。
 const DISCORD_COOKIES = process.env.DISCORD_COOKIES || '';
 const DISCORD_LOCAL_STORAGE = process.env.DISCORD_LOCAL_STORAGE || '';
-// 本轮 OAuth 换到的新鲜 auth（原始 JSON 字符串）。上下文若被重建（验证失败重
-// 启浏览器路径），env 里的旧 auth 会被重新注入——导出回写时用它覆盖，防旧令牌
-// 反写覆盖新令牌。
+
 let freshAuthJson = null;
 let reloginTried = false;
 const CLAIM_URL = 'https://app.axenthost.com/claim';
-// v12（2026-11-06）：每轮失败尝试上限 2 次，轮与轮之间交给整点节奏重试。
 const MAX_ATTEMPTS = 2;
-// v7：记录挑战是否处于“不可见”状态。
 let lastTurnstileInvisible = false;
 
 const SCREENSHOT_DIR = 'screenshots';
@@ -48,7 +39,7 @@ if (!fs.existsSync(SCREENSHOT_DIR)) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// v8：按出口 IP 的真实地理位置对齐浏览器时区。
+// 按出口 IP 的真实地理位置对齐浏览器时区
 let egressGeoCache = null;
 async function detectEgressGeo() {
   if (egressGeoCache) return egressGeoCache;
@@ -84,7 +75,7 @@ async function takeScreenshot(page, name) {
   }
 }
 
-// 模拟 ESC，清理弹窗广告
+// 模拟 ESC，清理遮挡弹窗/广告
 async function dismissAdModals(page) {
   try {
     await page.keyboard.press('Escape');
@@ -136,29 +127,24 @@ async function getTurnstileWidget(page) {
   return null;
 }
 
-// v22：解析当前 secret 里 Axent 令牌的到期时刻（毫秒）
+// 解析当前 secret 里 Axent 令牌的到期时刻（毫秒）
 function storedAuthExpiresAt() {
   try {
     if (!AXENT_LOCAL_STORAGE) return null;
     const storage = JSON.parse(unpackSecretValue(AXENT_LOCAL_STORAGE));
     const auth = storage.auth ? JSON.parse(storage.auth) : null;
-    const expRaw = auth?.token?.expiresAt;
-    const exp = typeof expRaw === 'number' ? expRaw : (expRaw ? Date.parse(expRaw) : NaN);
+    const exp = auth?.token?.expiresAt ? Date.parse(auth.token.expiresAt) : NaN;
     return Number.isNaN(exp) ? null : exp;
   } catch {
     return null;
   }
 }
 
-// v22：把 Discord 会话注入上下文
+// 注入 Discord 会话
 async function injectDiscordSession(context) {
   if (DISCORD_LOCAL_STORAGE) {
     try {
-      const parsed = JSON.parse(unpackSecretValue(DISCORD_LOCAL_STORAGE));
-      // v22.6：兼容导出文件原格式 {ls, ss, cookie, ts}——直接存整文件时，真正
-      // 的 localStorage 在 ls 里；只按扁平 {key: value} 注入会把 ls 当成一个键，
-      // token 永远进不去（v22.3 轮实证：导出只有 15 字节）。
-      const storage = (parsed && typeof parsed === 'object' && parsed.ls && typeof parsed.ls === 'object') ? parsed.ls : parsed;
+      const storage = JSON.parse(unpackSecretValue(DISCORD_LOCAL_STORAGE));
       await context.addInitScript((items) => {
         if (!window.location.hostname.endsWith('discord.com')) return;
         for (const [k, v] of Object.entries(items)) {
@@ -173,15 +159,7 @@ async function injectDiscordSession(context) {
   if (DISCORD_COOKIES) {
     try {
       const parsed = JSON.parse(DISCORD_COOKIES);
-      // v22.6：同理兼容 {cookie: "a=b; c=d"} 这种导出文件原格式
-      let raw = parsed;
-      if (parsed && !Array.isArray(parsed) && typeof parsed.cookie === 'string') {
-        raw = parsed.cookie.split(';').map((p) => {
-          const i = p.indexOf('=');
-          return i > 0 ? { name: p.slice(0, i).trim(), value: p.slice(i + 1).trim(), domain: '.discord.com', path: '/' } : null;
-        }).filter(Boolean);
-      }
-      const cookies = raw
+      const cookies = parsed
         .filter((item) => (item.domain || '').replace(/^\./, '').toLowerCase().endsWith('discord.com'))
         .map((item) => ({
           name: item.name,
@@ -201,20 +179,13 @@ async function injectDiscordSession(context) {
   }
 }
 
-// v22：导出 Discord 会话
+// 导出 Discord 会话
 async function exportDiscordState(context) {
   try {
     const state = await context.storageState();
     const origin = (state.origins || []).find((o) => o.origin === 'https://discord.com');
     const items = origin?.localStorage || [];
-    // v22.6：绝不拿空会话覆盖好 secret。v22.3 轮的回写把 DISCORD secrets 覆
-    // 写成 15 字节的空导出（token 不在 localStorage 里），原会话就此丢失。
-    // 只有拿到像样的 token（≥20 字符）才写文件，否则直接跳过。
-    const tokenItem = items.find((i) => (i.name === 'token' || i.name === 'tokens') && i.value && String(i.value).length >= 20);
-    if (!tokenItem) {
-      console.log('[relogin] refusing to export discord state: no usable token in this context (would overwrite a good secret with an empty one)');
-      return false;
-    }
+    if (!items.some((i) => (i.name === 'token' || i.name === 'tokens') && i.value)) return false;
     const keep = {};
     for (const i of items) {
       if (i.name === 'token' || i.name === 'tokens') keep[i.name] = i.value;
@@ -244,30 +215,15 @@ async function exportDiscordState(context) {
   return false;
 }
 
-// v22：走 Discord OAuth 换新 24h 令牌
-// v22.4：重登在独立上下文（rc）里做，与主领取上下文完全隔离。v22.2 曾在主上下
-// 文里清旧 auth——localStorage 按源共享，清掉后主流程的领取页也会失联（v22.3
-// 验证轮因此 0 领）。独立上下文里没有旧 auth，/login 不会重定向，失败也不伤主会话。
-async function reloginViaDiscord(browser, context) {
+// 走 Discord OAuth 换新 24h 令牌
+async function reloginViaDiscord(context) {
   const prevExp = storedAuthExpiresAt() || 0;
-  const geo = await detectEgressGeo();
-  const rc = await browser.newContext({
-    viewport: { width: 1920, height: 1080 },
-    locale: 'en-US',
-    timezoneId: geo.timezone || 'America/New_York',
-  });
-  await rc.addInitScript(() => {
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-  });
-  const page = await rc.newPage();
+  const page = await context.newPage();
   try {
-    await injectDiscordSession(rc);
+    await injectDiscordSession(context);
     await page.goto('https://app.axenthost.com/login', { waitUntil: 'domcontentloaded', timeout: 60000 });
     await sleep(3000);
-    // v22.3：登录页的按钮文案就是 "Discord"（Apple / Discord / Google 三个并列
-    // 社交按钮），没有 "Login with Discord" 这几个字。旧选择器永远匹配不到，
-    // 导致 #973 与 v22.2 验证轮两次 relogin-button-not-found。
-    const loginBtn = page.locator('button:has-text("Discord")').first();
+    const loginBtn = page.locator('button:has-text("Login with Discord"), a:has-text("Login with Discord")').first();
     if ((await loginBtn.count().catch(() => 0)) === 0) {
       await takeScreenshot(page, 'relogin-no-discord-button');
       return { ok: false, reason: 'relogin-button-not-found' };
@@ -275,23 +231,6 @@ async function reloginViaDiscord(browser, context) {
     await loginBtn.click();
     await page.waitForURL(/discord\.com/, { timeout: 45000 }).catch(() => {});
     await sleep(4000);
-    // v22.5：Discord 会先弹 "Discord App Launched" 中转页（"Continue to Discord"
-    // 按钮），要点它才回到网页授权页。v22.4 验证轮的截图实证：会话本身是有效
-    // 的（已到达 authorize 地址），只是卡在这层中转页上。
-    const continueBtn = page.locator('button:has-text("Continue to Discord")').first();
-    if ((await continueBtn.count().catch(() => 0)) > 0) {
-      console.log('[relogin] Discord app-launch interstitial found, clicking Continue to Discord');
-      await continueBtn.click().catch(() => {});
-      await page.waitForURL(/oauth2\/authorize/, { timeout: 30000 }).catch(() => {});
-      await sleep(3000);
-    }
-    // 未登录的 Discord 会话会被 Discord 直接送到 /login（而不是授权页），
-    // 按 URL 判定比等表单渲染更可靠（v22.3 验证轮：表单未渲染时误判成
-    // authorize-button-not-found）。
-    if (page.url().includes('/login') && !page.url().includes('/oauth2/authorize')) {
-      await takeScreenshot(page, 'relogin-discord-session-dead');
-      return { ok: false, reason: 'discord-session-expired' };
-    }
     if (page.url().includes('/oauth2/authorize')) {
       const hasLoginForm = (await page.locator('input[name="email"], input[type="email"]').count().catch(() => 0)) > 0;
       if (hasLoginForm) {
@@ -317,36 +256,10 @@ async function reloginViaDiscord(browser, context) {
         try {
           const a = JSON.parse(authJson);
           const exp = a?.token?.expiresAt ? Date.parse(a.token.expiresAt) : 0;
-          // v22.1（2026-11-09 晚）：账号身份校验。新令牌的账号必须与旧令牌一致，
-          // 否则 DISCORD 会话若是另一个 Discord 号（如 slabykh.1982），重登会把
-          // 主号的 secrets 覆盖成空号令牌，整点领取直接断供。身份不一致时拒绝
-          // 换令牌、不回写，本轮继续用旧令牌领取，旧令牌在到期前仍有效。
-          const idOf = (u) => (u ? (u.email || u.pseudo || u.username || null) : null);
-          let oldId = null;
-          try {
-            const oldStorage = JSON.parse(unpackSecretValue(AXENT_LOCAL_STORAGE));
-            oldId = idOf(oldStorage.auth ? JSON.parse(oldStorage.auth).user : null);
-          } catch {}
-          const newId = idOf(a?.user);
-          if (oldId && newId && oldId !== newId) {
-            console.log(`[relogin] ACCOUNT MISMATCH: new token user=${newId} != stored user=${oldId}; refusing to replace secrets`);
-            await takeScreenshot(page, 'relogin-account-mismatch');
-            return { ok: false, reason: 'relogin-account-mismatch', expected: oldId, got: newId };
-          }
           if (exp > prevExp + 60000 && exp - Date.now() > 3 * 3600 * 1000) {
             freshAuthJson = authJson;
             console.log(`[relogin] fresh token minted, expiresAt=${a.token.expiresAt}, user=${a?.user?.pseudo || a?.user?.email || '?'}`);
-            // v22.4：新令牌在独立上下文里，先同步进主上下文的共享存储，后续
-            // 领取页才能用上；Axent 状态从主上下文导出，Discord 状态从重登上下文导出。
-            const syncPage = await context.newPage();
-            try {
-              await syncPage.goto('https://app.axenthost.com/', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
-              await syncPage.evaluate((auth) => window.localStorage.setItem('auth', auth), freshAuthJson).catch(() => {});
-            } finally {
-              await syncPage.close().catch(() => {});
-            }
             await exportFreshState(context, null).catch(() => {});
-            await exportDiscordState(rc).catch(() => {});
             return { ok: true, expiresAt: a.token.expiresAt };
           }
         } catch {}
@@ -357,10 +270,11 @@ async function reloginViaDiscord(browser, context) {
   } catch (e) {
     return { ok: false, reason: 'relogin-exception', error: e.message };
   } finally {
-    await rc.close().catch(() => {});
+    await page.close().catch(() => {});
   }
 }
 
+// 导出凭据：加入防毒保护，未处于登录态时绝不生成文件并清理脏文件
 async function exportFreshState(context, page) {
   await exportDiscordState(context).catch(() => {});
   try {
@@ -674,7 +588,6 @@ async function tryInFrameClick(page) {
     }
   }
 
-  // 备用：外框推算坐标点击
   const widget = await getTurnstileWidget(page);
   if (widget && widget.box) {
     const cx = Math.round(widget.box.x + 28);
@@ -793,7 +706,6 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
       console.log('[turnstile] click dispatch returned false');
     }
   } else {
-    // 只有在 iframe 与容器确实皆未渲染时才触发 reload
     lastTurnstileInvisible = true;
     console.log('[turnstile] challenge frame truly empty, reloading once...');
     await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
@@ -826,7 +738,7 @@ async function humanDwell(page, totalMs) {
   }
 }
 
-// 等待领取页 UI 真实渲染（优化超时，避免在卡死的骨架屏上等待耗满）
+// 等待领取页 UI 真实渲染（压缩超时，避免卡在骨架屏耗尽全局时间）
 async function waitForClaimUi(page, timeoutSec, tag) {
   const start = Date.now();
   let poll = 0;
@@ -858,6 +770,13 @@ async function claimOnce(context, attemptIndex) {
   const page = await context.newPage();
   let api401Count = 0;
 
+  // 每次打开新页面确保挂载最新的 auth 令牌
+  if (freshAuthJson) {
+    await page.addInitScript((token) => {
+      window.localStorage.setItem('auth', token);
+    }, freshAuthJson).catch(() => {});
+  }
+
   page.on('requestfailed', (req) => {
     const u = req.url();
     console.log(`[net] requestfailed ${u.slice(0, 100)} ${req.failure()?.errorText || ''}`);
@@ -887,7 +806,6 @@ async function claimOnce(context, attemptIndex) {
     })).catch(() => null);
     if (diag) console.log(`[diag] turnstileApi=${diag.turnstileApi} widgetDivs=${diag.widgetDivs} iframes=${JSON.stringify(diag.iframes)}`);
 
-    // UI 就绪性判断（由 90s 精简为 35s，避免卡死空耗预算）
     let uiReady = await waitForClaimUi(page, 35, 'direct');
     if (!uiReady) {
       const resTail = await page.evaluate(() => performance.getEntriesByType('resource').slice(-25).map((e) => `${e.name.slice(0, 80)} dur=${Math.round(e.duration)} end=${Math.round(e.responseEnd)}`)).catch(() => []);
@@ -916,7 +834,7 @@ async function claimOnce(context, attemptIndex) {
     }
 
     if (!uiReady && api401Count >= 3) {
-      console.log(`[auth] claim UI never rendered and API returned 401 x${api401Count} — stored session token expired/invalid, secrets need a fresh login export`);
+      console.log(`[auth] claim UI never rendered and API returned 401 x${api401Count} — stored session token expired/invalid`);
       await takeScreenshot(page, `attempt${attemptIndex}-session-expired`);
       return { ok: false, reason: 'session-expired-api-401' };
     }
@@ -1067,11 +985,6 @@ async function buildContext(browser) {
       await context.addInitScript((items) => {
         for (const [k, v] of Object.entries(items)) {
           if (k === 'auth' && window.localStorage.getItem('auth')) continue;
-          // v22.2：重登页用 sessionStorage 标记跳过注入，否则 /login 会因旧 auth
-          // 被 SPA 重定向回站内，Discord 按钮永远不出现（#973 截图实证）。
-          if (k === 'auth') {
-            try { if (window.sessionStorage.getItem('axent-relogin')) continue; } catch {}
-          }
           window.localStorage.setItem(k, v);
         }
       }, storage);
@@ -1091,7 +1004,7 @@ async function buildContext(browser) {
         return !isCfHost && !cfCookieName.test(item.name || '');
       });
       const dropped = parsed.length - kept.length;
-      if (dropped > 0) console.log(`[auth] dropped ${dropped} stored Cloudflare cookies at injection (v13)`);
+      if (dropped > 0) console.log(`[auth] dropped ${dropped} stored Cloudflare cookies at injection`);
       const cookies = kept.map((item) => ({
         name: item.name,
         value: item.value,
@@ -1137,14 +1050,11 @@ async function buildContext(browser) {
     if (!exp || msLeft < 90 * 60 * 1000) {
       console.log('[relogin] token expired or <90min left — attempting Discord OAuth relogin before claiming');
       reloginTried = true;
-      const r = await reloginViaDiscord(browser, context);
+      const r = await reloginViaDiscord(context);
       console.log('[relogin] proactive relogin result:', JSON.stringify(r));
     } else {
-      console.log(`[relogin] token fresh enough, skipping proactive relogin (will trigger after ${new Date(exp - 90 * 60 * 1000).toISOString()})`);
+      console.log('[relogin] token fresh enough, skipping proactive relogin');
     }
-  } else {
-    const exp = storedAuthExpiresAt();
-    console.log(`[relogin] DISCORD_* secrets not configured — auto relogin disarmed (v21 behaviour); stored token expiresAt=${exp ? new Date(exp).toISOString() : 'unknown'}`);
   }
 
   for (let attemptNo = 1; ; attemptNo++) {
@@ -1179,11 +1089,14 @@ async function buildContext(browser) {
     }
 
     failures++;
-    if (result.reason === 'session-expired-api-401') {
+
+    // 核心修复：同时捕获 401 与 cookies-expired-or-not-logged-in 失效重定向
+    const isSessionDead = result.reason === 'session-expired-api-401' || result.reason === 'cookies-expired-or-not-logged-in';
+    if (isSessionDead) {
       if (discordConfigured && !reloginTried) {
         reloginTried = true;
-        console.log('[relogin] 401 mid-run — attempting Discord OAuth relogin once');
-        const r = await reloginViaDiscord(browser, context);
+        console.log(`[relogin] session dead (${result.reason}) — triggering Discord OAuth relogin immediately`);
+        const r = await reloginViaDiscord(context);
         console.log('[relogin] mid-run relogin result:', JSON.stringify(r));
         if (r.ok) {
           failures = 0;
@@ -1192,9 +1105,10 @@ async function buildContext(browser) {
           continue;
         }
       }
-      console.log('[run] stored session expired (API 401); retrying with the same secrets is pointless — needs a fresh login export');
+      console.log(`[run] stored session expired (${result.reason}); Discord relogin unavailable/failed — stopping`);
       break;
     }
+
     if (result.invisibleChallenge) {
       console.log('[run] invisible challenge on this attempt; treating as retryable verification failure');
     }
@@ -1222,7 +1136,15 @@ async function buildContext(browser) {
 
   console.log(`[claim] total claimed this run: ${claimedCount}`);
 
-  await exportFreshState(context, null).catch(() => {});
+  // 只有当轮成功，或者成功换取了新 auth 时才最终导出，防止把未登录空会话写回 Secrets
+  if (result.ok || freshAuthJson) {
+    await exportFreshState(context, null).catch(() => {});
+  } else {
+    console.log('[auth] run failed without fresh auth, aborting final secret export to prevent poisoning');
+    if (fs.existsSync('fresh-cookies.json')) fs.unlinkSync('fresh-cookies.json');
+    if (fs.existsSync('fresh-localstorage.json')) fs.unlinkSync('fresh-localstorage.json');
+  }
+
   await browser.close();
   console.log('FINAL:', JSON.stringify(result));
 
