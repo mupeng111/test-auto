@@ -142,7 +142,8 @@ function storedAuthExpiresAt() {
     if (!AXENT_LOCAL_STORAGE) return null;
     const storage = JSON.parse(unpackSecretValue(AXENT_LOCAL_STORAGE));
     const auth = storage.auth ? JSON.parse(storage.auth) : null;
-    const exp = auth?.token?.expiresAt ? Date.parse(auth.token.expiresAt) : NaN;
+    const expRaw = auth?.token?.expiresAt;
+    const exp = typeof expRaw === 'number' ? expRaw : (expRaw ? Date.parse(expRaw) : NaN);
     return Number.isNaN(exp) ? null : exp;
   } catch {
     return null;
@@ -255,6 +256,16 @@ async function reloginViaDiscord(browser, context) {
     await loginBtn.click();
     await page.waitForURL(/discord\.com/, { timeout: 45000 }).catch(() => {});
     await sleep(4000);
+    // v22.5：Discord 会先弹 "Discord App Launched" 中转页（"Continue to Discord"
+    // 按钮），要点它才回到网页授权页。v22.4 验证轮的截图实证：会话本身是有效
+    // 的（已到达 authorize 地址），只是卡在这层中转页上。
+    const continueBtn = page.locator('button:has-text("Continue to Discord")').first();
+    if ((await continueBtn.count().catch(() => 0)) > 0) {
+      console.log('[relogin] Discord app-launch interstitial found, clicking Continue to Discord');
+      await continueBtn.click().catch(() => {});
+      await page.waitForURL(/oauth2\/authorize/, { timeout: 30000 }).catch(() => {});
+      await sleep(3000);
+    }
     // 未登录的 Discord 会话会被 Discord 直接送到 /login（而不是授权页），
     // 按 URL 判定比等表单渲染更可靠（v22.3 验证轮：表单未渲染时误判成
     // authorize-button-not-found）。
