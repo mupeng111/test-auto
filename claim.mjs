@@ -134,13 +134,11 @@ async function sweepFullscreenAds(page) {
 // 模拟 ESC，强力粉碎包括 Google Vignette 全屏遮罩在内的所有广告阻碍
 async function dismissAdModals(page) {
   try {
-    // 1. 如果被 Google 插页广告带偏了 URL hash，清洗并恢复路由
     if (page.url().includes('#google_vignette')) {
       console.log('[ads] detected #google_vignette overlay, sweeping and recovering...');
       await closeVignette(page);
       await sweepFullscreenAds(page);
       await page.keyboard.press('Escape');
-      // 强行把页面 hash 抹去，恢复 SPA 路由状态
       await page.evaluate(() => {
         if (window.location.hash.includes('google_vignette')) {
           history.replaceState(null, '', window.location.pathname);
@@ -148,16 +146,12 @@ async function dismissAdModals(page) {
       }).catch(() => {});
       await sleep(1000);
     }
-
-    // 2. 尝试关闭普通弹窗广告
     await closeVignette(page);
     await page.keyboard.press('Escape');
     const closeBtn = page.locator('button:has-text("Close"), text=/^Close$/i, [aria-label="Close"]').first();
     if (await closeBtn.isVisible().catch(() => false)) {
       await closeBtn.click({ force: true, timeout: 1500 }).catch(() => {});
     }
-
-    // 3. 清理全屏遮罩
     await sweepFullscreenAds(page);
   } catch {}
 }
@@ -203,7 +197,19 @@ function storedAuthExpiresAt() {
   }
 }
 
-// 注入 Discord 会话
+// 提取清洗后的 Discord Token 字符串
+function getCleanDiscordToken() {
+  if (!DISCORD_LOCAL_STORAGE) return '';
+  try {
+    const storage = JSON.parse(unpackSecretValue(DISCORD_LOCAL_STORAGE));
+    const tok = storage.token || storage.tokens || '';
+    return String(tok).replace(/\\"/g, '"').replace(/^"+|"+$/g, '').trim();
+  } catch {
+    return '';
+  }
+}
+
+// 注入 Discord 会话（基础 initScript）
 async function injectDiscordSession(context) {
   if (DISCORD_LOCAL_STORAGE) {
     try {
@@ -242,17 +248,69 @@ async function injectDiscordSession(context) {
   }
 }
 
+// 显式激活 Discord 网页会话（绕过未登录态）
+async function activateDiscordSession(page, cleanToken) {
+  if (!cleanToken) return false;
+  console.log('[relogin] pre-warming Discord session at discord.com/login...');
+  try {
+    await page.goto('https://discord.com/login', { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await sleep(2500);
+
+    // 借助同源隐藏 iframe 注入 Token 到 LocalStorage 和 IndexedDB
+    await page.evaluate((tok) => {
+      try {
+        const iframe = document.createElement('iframe');
+        iframe.style.display = 'none';
+        document.body.appendChild(iframe);
+        iframe.contentWindow.localStorage.setItem('token', `"${tok}"`);
+
+        // 同步尝试注入到 IndexedDB
+        const req = indexedDB.open('discord');
+        req.onupgradeneeded = (e) => {
+          const db = e.target.result;
+          if (!db.objectStoreNames.contains('keyvaluepairs')) {
+            db.createObjectStore('keyvaluepairs');
+          }
+        };
+        req.onsuccess = (e) => {
+          try {
+            const db = e.target.result;
+            const tx = db.transaction('keyvaluepairs', 'readwrite');
+            tx.objectStore('keyvaluepairs').put(tok, 'token');
+          } catch {}
+        };
+        iframe.remove();
+      } catch {}
+    }, cleanToken);
+
+    // 刷新页面让 Discord 前端加载并识别 session
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+    await sleep(3500);
+
+    const currentUrl = page.url();
+    console.log(`[relogin] discord session warmed, url: ${currentUrl}`);
+    return !currentUrl.includes('/login');
+  } catch (e) {
+    console.log(`[relogin] discord pre-warm notice: ${e.message}`);
+    return false;
+  }
+}
+
 // 导出 Discord 会话
 async function exportDiscordState(context) {
   try {
     const state = await context.storageState();
     const origin = (state.origins || []).find((o) => o.origin === 'https://discord.com');
     const items = origin?.localStorage || [];
-    if (!items.some((i) => (i.name === 'token' || i.name === 'tokens') && i.value)) return false;
     const keep = {};
     for (const i of items) {
       if (i.name === 'token' || i.name === 'tokens') keep[i.name] = i.value;
     }
+    const cleanTok = getCleanDiscordToken();
+    if (!keep['token'] && cleanTok) {
+      keep['token'] = `"${cleanTok}"`;
+    }
+
     const mappedAll = (await context.cookies()).map((c) => ({
       name: c.name,
       value: c.value,
@@ -267,11 +325,14 @@ async function exportDiscordState(context) {
       const host = (c.domain || '').replace(/^\./, '').toLowerCase();
       return host === 'discord.com' || host.endsWith('.discord.com');
     });
-    fs.writeFileSync('fresh-discord-cookies.json', JSON.stringify(discordCookies));
-    const packed = packSecretValue(JSON.stringify(keep));
-    fs.writeFileSync('fresh-discord-localstorage.json', packed.value);
-    console.log(`[relogin] discord session state saved (storage: ${packed.bytes} bytes, cookies: ${discordCookies.length})`);
-    return true;
+
+    if (keep['token']) {
+      fs.writeFileSync('fresh-discord-cookies.json', JSON.stringify(discordCookies));
+      const packed = packSecretValue(JSON.stringify(keep));
+      fs.writeFileSync('fresh-discord-localstorage.json', packed.value);
+      console.log(`[relogin] discord session state saved (storage: ${packed.bytes} bytes, cookies: ${discordCookies.length})`);
+      return true;
+    }
   } catch (e) {
     console.error('[relogin] failed to export discord state:', e.message);
   }
@@ -284,6 +345,13 @@ async function reloginViaDiscord(context) {
   const page = await context.newPage();
   try {
     await injectDiscordSession(context);
+
+    // 关键修正：在访问 Axent 授权前先将 Discord 会话预热激活
+    const cleanToken = getCleanDiscordToken();
+    if (cleanToken) {
+      await activateDiscordSession(page, cleanToken);
+    }
+
     await page.goto('https://app.axenthost.com/login', { waitUntil: 'domcontentloaded', timeout: 60000 });
     await sleep(3000);
     const loginBtn = page.locator('button:has-text("Login with Discord"), a:has-text("Login with Discord")').first();
@@ -294,6 +362,7 @@ async function reloginViaDiscord(context) {
     await loginBtn.click();
     await page.waitForURL(/discord\.com/, { timeout: 45000 }).catch(() => {});
     await sleep(4000);
+
     if (page.url().includes('/oauth2/authorize')) {
       const hasLoginForm = (await page.locator('input[name="email"], input[type="email"]').count().catch(() => 0)) > 0;
       if (hasLoginForm) {
@@ -308,6 +377,7 @@ async function reloginViaDiscord(context) {
       await authBtn.click();
       console.log('[relogin] clicked Authorise on discord oauth page');
     }
+
     await page.waitForURL(/app\.axenthost\.com/, { timeout: 60000 }).catch(() => {});
     for (let i = 0; i < 15; i++) {
       await sleep(2000);
@@ -406,7 +476,7 @@ async function exportFreshState(context, page) {
   return false;
 }
 
-// 确保页面停留在真实的领取页（彻底粉碎 #google_vignette 阻碍）
+// 确保页面停留在真实的领取页
 async function ensureOnClaimPage(page) {
   const isDirectlyReady = async () => {
     try {
@@ -419,7 +489,6 @@ async function ensureOnClaimPage(page) {
     }
   };
 
-  // 1. 如果当前路由不在 /claim，或者被插页广告污染带了 hash，直接强制导航
   if (!page.url().includes('/claim') || page.url().includes('#google_vignette')) {
     console.log('[nav] navigating directly to /claim...');
     await page.goto(CLAIM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
@@ -427,7 +496,6 @@ async function ensureOnClaimPage(page) {
     await dismissAdModals(page);
   }
 
-  // 2. 只要处于 /claim 路径，耐心等待组件渲染，杜绝跳出
   if (page.url().includes('/claim')) {
     for (let i = 0; i < 10; i++) {
       if (await isDirectlyReady()) {
@@ -438,7 +506,6 @@ async function ensureOnClaimPage(page) {
     }
   }
 
-  // 3. 只有明确被后端重定向到了 /servers，才点击侧边栏 Credits 纠偏
   if (page.url().includes('/servers')) {
     console.log('[nav] redirected to /servers, clicking sidebar Credits...');
     const creditsSidebarBtn = page.locator('a[href*="credits"], a:has-text("Credits")').first();
@@ -449,7 +516,6 @@ async function ensureOnClaimPage(page) {
     }
   }
 
-  // 4. 若停留在 /credits 汇总页，点击黄色的 Claim free credits 进入真实领取页
   if (page.url().includes('/credits') && !page.url().includes('/claim')) {
     console.log('[nav] on /credits summary, clicking "Claim free credits" button...');
     const claimEntryBtn = page.locator('button:has-text("Claim free credits"), a:has-text("Claim free credits")').first();
@@ -706,9 +772,7 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
   const startedAt = Date.now();
   const waitedSec = () => Math.round((Date.now() - startedAt) / 1000);
 
-  // 阶段 1：被动等 token（最长等待 46 秒）
   for (let i = 0; i < 23; i++) {
-    // 途中定期巡检广告遮罩
     if (i % 5 === 0) await dismissAdModals(page);
 
     if (await checkTurnstilePassed(page)) {
@@ -721,7 +785,6 @@ async function waitAndSolveTurnstile(page, attemptIndex) {
     await sleep(2000);
   }
 
-  // 阶段 2：直接探查复选框组件并执行点击
   const { rendered } = await checkChallengeRendered(page);
   const frameText = await challengeFrameText(page);
 
@@ -777,7 +840,7 @@ async function humanDwell(page, totalMs) {
   }
 }
 
-// 等待领取页 UI 真实渲染（修复把正常 claim 骨架屏误判为超时的 Bug）
+// 等待领取页 UI 真实渲染
 async function waitForClaimUi(page, timeoutSec, tag) {
   const start = Date.now();
   let poll = 0;
@@ -799,7 +862,6 @@ async function waitForClaimUi(page, timeoutSec, tag) {
       };
     }).catch(() => null);
 
-    // 只要有领取文字、按钮或组件，立即认定 UI 已经就绪，绝对不倒退回 /servers
     if (st && (st.hasClaimBtn || st.hasClaimText || st.hasWidget || st.hasCfFrame)) {
       console.log(`[load:${tag}] claim UI ready ${JSON.stringify(st)}`);
       return true;
