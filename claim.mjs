@@ -28,6 +28,7 @@ const DISCORD_LOCAL_STORAGE = process.env.DISCORD_LOCAL_STORAGE || '';
 
 let freshAuthJson = null;
 let reloginTried = false;
+let discordVisited = false;
 const CLAIM_URL = 'https://app.axenthost.com/claim';
 const MAX_ATTEMPTS = 2;
 let lastTurnstileInvisible = false;
@@ -131,7 +132,7 @@ async function sweepFullscreenAds(page) {
   }
 }
 
-// 模拟 ESC，强力粉碎包括 Google Vignette 全屏遮罩在内的所有广告阻碍
+// 模拟 ESC，清理遮挡弹窗/广告
 async function dismissAdModals(page) {
   try {
     if (page.url().includes('#google_vignette')) {
@@ -209,22 +210,21 @@ function getCleanDiscordToken() {
   }
 }
 
-// 注入 Discord 会话（基础 initScript）
+// 注入 Discord 会话（必须在 newPage 之前调用，确保首跳即注入 localStorage）
 async function injectDiscordSession(context) {
-  if (DISCORD_LOCAL_STORAGE) {
-    try {
-      const storage = JSON.parse(unpackSecretValue(DISCORD_LOCAL_STORAGE));
-      await context.addInitScript((items) => {
-        if (!window.location.hostname.endsWith('discord.com')) return;
-        for (const [k, v] of Object.entries(items)) {
-          try { window.localStorage.setItem(k, v); } catch {}
-        }
-      }, storage);
-      console.log('[relogin] discord localStorage injection armed');
-    } catch (e) {
-      console.error('[relogin] failed to parse DISCORD_LOCAL_STORAGE:', e.message);
-    }
+  const cleanTok = getCleanDiscordToken();
+  if (cleanTok) {
+    await context.addInitScript((tok) => {
+      if (!window.location.hostname.endsWith('discord.com')) return;
+      try {
+        window.localStorage.setItem('token', `"${tok}"`);
+      } catch {}
+    }, cleanTok);
+    console.log('[relogin] discord localStorage injection armed');
+  } else if (DISCORD_LOCAL_STORAGE) {
+    console.error('[relogin] DISCORD_LOCAL_STORAGE is set but token is empty after parsing');
   }
+
   if (DISCORD_COOKIES) {
     try {
       const parsed = JSON.parse(DISCORD_COOKIES);
@@ -240,64 +240,63 @@ async function injectDiscordSession(context) {
           secure: item.secure || false,
           sameSite: ['Strict', 'Lax', 'None'].includes(item.sameSite) ? item.sameSite : 'Lax',
         }));
-      await context.addCookies(cookies);
-      console.log(`[relogin] injected ${cookies.length} discord cookies`);
+      if (cookies.length > 0) {
+        await context.addCookies(cookies);
+        console.log(`[relogin] injected ${cookies.length} discord cookies`);
+      }
     } catch (e) {
       console.error('[relogin] failed to parse DISCORD_COOKIES:', e.message);
     }
   }
 }
 
-// 显式激活 Discord 网页会话（绕过未登录态）
+// 显式激活 Discord 网页会话（访问 /channels/@me 验证并预热登录态）
 async function activateDiscordSession(page, cleanToken) {
   if (!cleanToken) return false;
-  console.log('[relogin] pre-warming Discord session at discord.com/login...');
+  discordVisited = true;
+  console.log('[relogin] pre-warming Discord session at discord.com/channels/@me...');
   try {
-    await page.goto('https://discord.com/login', { waitUntil: 'domcontentloaded', timeout: 45000 });
-    await sleep(2500);
+    await page.goto('https://discord.com/channels/@me', { waitUntil: 'domcontentloaded', timeout: 45000 });
 
-    // 借助同源隐藏 iframe 注入 Token 到 LocalStorage 和 IndexedDB
+    // 兜底通过同源 iframe 再次写入 Token，防止首次加载时序偏差
     await page.evaluate((tok) => {
       try {
         const iframe = document.createElement('iframe');
         iframe.style.display = 'none';
         document.body.appendChild(iframe);
         iframe.contentWindow.localStorage.setItem('token', `"${tok}"`);
-
-        // 同步尝试注入到 IndexedDB
-        const req = indexedDB.open('discord');
-        req.onupgradeneeded = (e) => {
-          const db = e.target.result;
-          if (!db.objectStoreNames.contains('keyvaluepairs')) {
-            db.createObjectStore('keyvaluepairs');
-          }
-        };
-        req.onsuccess = (e) => {
-          try {
-            const db = e.target.result;
-            const tx = db.transaction('keyvaluepairs', 'readwrite');
-            tx.objectStore('keyvaluepairs').put(tok, 'token');
-          } catch {}
-        };
         iframe.remove();
       } catch {}
-    }, cleanToken);
+    }, cleanToken).catch(() => {});
 
-    // 刷新页面让 Discord 前端加载并识别 session
-    await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
-    await sleep(3500);
-
-    const currentUrl = page.url();
-    console.log(`[relogin] discord session warmed, url: ${currentUrl}`);
-    return !currentUrl.includes('/login');
+    // 轮询等待 Discord SPA 完成身份校验（最多 16 秒）
+    for (let i = 0; i < 8; i++) {
+      await sleep(2000);
+      const u = page.url();
+      const hasLoginInput = (await page.locator('input[name="email"], input[type="email"]').count().catch(() => 0)) > 0;
+      if (hasLoginInput) {
+        // 遇到登录框时刷新一次以应用刚写入的 iframe storage
+        if (i === 1) {
+          console.log('[relogin] reloading discord page to apply token...');
+          await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+          continue;
+        }
+      } else if (u.includes('/channels/')) {
+        console.log(`[relogin] discord session active, url: ${u}`);
+        return true;
+      }
+    }
+    console.log(`[relogin] discord pre-warm finished, url: ${page.url()}`);
+    return !page.url().includes('/login');
   } catch (e) {
     console.log(`[relogin] discord pre-warm notice: ${e.message}`);
     return false;
   }
 }
 
-// 导出 Discord 会话
+// 导出 Discord 会话（仅在访问过 Discord 时更新，避免空 Cookie 覆盖原有设备指纹）
 async function exportDiscordState(context) {
+  if (!discordVisited) return false;
   try {
     const state = await context.storageState();
     const origin = (state.origins || []).find((o) => o.origin === 'https://discord.com');
@@ -327,7 +326,9 @@ async function exportDiscordState(context) {
     });
 
     if (keep['token']) {
-      fs.writeFileSync('fresh-discord-cookies.json', JSON.stringify(discordCookies));
+      if (discordCookies.length > 0) {
+        fs.writeFileSync('fresh-discord-cookies.json', JSON.stringify(discordCookies));
+      }
       const packed = packSecretValue(JSON.stringify(keep));
       fs.writeFileSync('fresh-discord-localstorage.json', packed.value);
       console.log(`[relogin] discord session state saved (storage: ${packed.bytes} bytes, cookies: ${discordCookies.length})`);
@@ -342,40 +343,84 @@ async function exportDiscordState(context) {
 // 走 Discord OAuth 换新 24h 令牌
 async function reloginViaDiscord(context) {
   const prevExp = storedAuthExpiresAt() || 0;
+  await injectDiscordSession(context);
   const page = await context.newPage();
   try {
-    await injectDiscordSession(context);
-
-    // 关键修正：在访问 Axent 授权前先将 Discord 会话预热激活
     const cleanToken = getCleanDiscordToken();
     if (cleanToken) {
       await activateDiscordSession(page, cleanToken);
     }
 
+    console.log('[relogin] navigating to AxentHost /login...');
     await page.goto('https://app.axenthost.com/login', { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await sleep(3000);
-    const loginBtn = page.locator('button:has-text("Login with Discord"), a:has-text("Login with Discord")').first();
-    if ((await loginBtn.count().catch(() => 0)) === 0) {
-      await takeScreenshot(page, 'relogin-no-discord-button');
-      return { ok: false, reason: 'relogin-button-not-found' };
-    }
-    await loginBtn.click();
-    await page.waitForURL(/discord\.com/, { timeout: 45000 }).catch(() => {});
-    await sleep(4000);
 
-    if (page.url().includes('/oauth2/authorize')) {
-      const hasLoginForm = (await page.locator('input[name="email"], input[type="email"]').count().catch(() => 0)) > 0;
-      if (hasLoginForm) {
-        await takeScreenshot(page, 'relogin-discord-session-dead');
-        return { ok: false, reason: 'discord-session-expired' };
+    // 轮询等待 AxentHost 登录页 SPA 渲染出 Discord 登录按钮（最多 30 秒）
+    let loginBtn = null;
+    for (let i = 0; i < 15; i++) {
+      const btn = page.locator('button:has-text("Discord"), a:has-text("Discord")').first();
+      if ((await btn.count().catch(() => 0)) > 0 && await btn.isVisible().catch(() => false)) {
+        loginBtn = btn;
+        break;
       }
-      const authBtn = page.locator('button:has-text("Authorise"), button:has-text("Authorize")').last();
-      if ((await authBtn.count().catch(() => 0)) === 0) {
+      // 如果已经自动跳转进站内页面，直接跳出
+      if (/app\.axenthost\.com\/(claim|servers|credits)/.test(page.url())) {
+        break;
+      }
+      await sleep(2000);
+    }
+
+    if (!loginBtn && !/app\.axenthost\.com\/(claim|servers|credits)/.test(page.url())) {
+      const bodySample = await page.evaluate(() => (document.body?.innerText || '').replace(/\s+/g, ' ').slice(0, 160)).catch(() => '');
+      console.log(`[relogin] login button not found on ${page.url()}, text=${JSON.stringify(bodySample)}`);
+      await takeScreenshot(page, 'relogin-no-discord-button');
+      return { ok: false, reason: 'relogin-button-not-found', url: page.url() };
+    }
+
+    if (loginBtn) {
+      await loginBtn.click({ force: true });
+      console.log('[relogin] clicked Login with Discord button');
+      await page.waitForURL(/discord\.com/, { timeout: 45000 }).catch(() => {});
+    }
+
+    // 在 Discord OAuth 页面轮询等待授权按钮出现（支持英文 Authorise/Authorize 及中文 授权/授權）
+    if (page.url().includes('discord.com')) {
+      discordVisited = true;
+      let approved = false;
+      for (let i = 0; i < 15; i++) {
+        await sleep(2000);
+        if (!page.url().includes('discord.com')) {
+          approved = true;
+          break;
+        }
+        const hasLoginForm = (await page.locator('input[name="email"], input[type="email"], input[type="password"]').count().catch(() => 0)) > 0;
+        if (hasLoginForm) {
+          await takeScreenshot(page, 'relogin-discord-session-dead');
+          return { ok: false, reason: 'discord-session-expired' };
+        }
+        // 向下滚动权限说明框，防止授权按钮被折叠或禁用
+        await page.evaluate(() => {
+          document.querySelectorAll('[class*="scroller"], [class*="content"]').forEach((el) => {
+            el.scrollTop = el.scrollHeight;
+          });
+        }).catch(() => {});
+
+        const authBtn = page.locator(
+          'button:has-text("Authorise"), button:has-text("Authorize"), button:has-text("授权"), button:has-text("授權")'
+        ).last();
+        if ((await authBtn.count().catch(() => 0)) > 0 && await authBtn.isVisible().catch(() => false)) {
+          await authBtn.click({ force: true });
+          console.log('[relogin] clicked OAuth approve button on discord page');
+          approved = true;
+          break;
+        }
+      }
+
+      if (!approved) {
+        const bodySample = await page.evaluate(() => (document.body?.innerText || '').replace(/\s+/g, ' ').slice(0, 160)).catch(() => '');
+        console.log(`[relogin] authorize button not found on ${page.url()}, text=${JSON.stringify(bodySample)}`);
         await takeScreenshot(page, 'relogin-no-authorize-button');
         return { ok: false, reason: 'authorize-button-not-found', url: page.url() };
       }
-      await authBtn.click();
-      console.log('[relogin] clicked Authorise on discord oauth page');
     }
 
     await page.waitForURL(/app\.axenthost\.com/, { timeout: 60000 }).catch(() => {});
@@ -1151,6 +1196,8 @@ async function buildContext(browser) {
   let waitedShortCooldown = false;
 
   const discordConfigured = !!(DISCORD_COOKIES || DISCORD_LOCAL_STORAGE);
+  let proactiveReloginFailedOnExpired = false;
+
   if (discordConfigured) {
     const exp = storedAuthExpiresAt();
     const msLeft = exp ? exp - Date.now() : 0;
@@ -1160,12 +1207,16 @@ async function buildContext(browser) {
       reloginTried = true;
       const r = await reloginViaDiscord(context);
       console.log('[relogin] proactive relogin result:', JSON.stringify(r));
+      if (!r.ok && exp && exp <= Date.now()) {
+        proactiveReloginFailedOnExpired = true;
+        result = { ok: false, reason: `proactive-relogin-failed:${r.reason}` };
+      }
     } else {
       console.log('[relogin] token fresh enough, skipping proactive relogin');
     }
   }
 
-  for (let attemptNo = 1; ; attemptNo++) {
+  for (let attemptNo = 1; !proactiveReloginFailedOnExpired; attemptNo++) {
     if (attemptNo > 1 && Date.now() - runStartedAt > 12 * 60 * 1000) {
       console.log('[run] time budget (12min) exhausted before new attempt, stopping cleanly');
       break;
