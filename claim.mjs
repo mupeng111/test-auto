@@ -250,7 +250,7 @@ async function injectDiscordSession(context) {
   }
 }
 
-// 显式激活 Discord 网页会话（访问 /channels/@me 验证并预热登录态）
+// 显式激活 Discord 网页会话（通过真实 DOM 元素确认登录成功，避免路由假阳性）
 async function activateDiscordSession(page, cleanToken) {
   if (!cleanToken) return false;
   discordVisited = true;
@@ -258,7 +258,6 @@ async function activateDiscordSession(page, cleanToken) {
   try {
     await page.goto('https://discord.com/channels/@me', { waitUntil: 'domcontentloaded', timeout: 45000 });
 
-    // 兜底通过同源 iframe 再次写入 Token，防止首次加载时序偏差
     await page.evaluate((tok) => {
       try {
         const iframe = document.createElement('iframe');
@@ -269,25 +268,30 @@ async function activateDiscordSession(page, cleanToken) {
       } catch {}
     }, cleanToken).catch(() => {});
 
-    // 轮询等待 Discord SPA 完成身份校验（最多 16 秒）
-    for (let i = 0; i < 8; i++) {
+    let reloaded = false;
+    for (let i = 0; i < 10; i++) {
       await sleep(2000);
       const u = page.url();
-      const hasLoginInput = (await page.locator('input[name="email"], input[type="email"]').count().catch(() => 0)) > 0;
-      if (hasLoginInput) {
-        // 遇到登录框时刷新一次以应用刚写入的 iframe storage
-        if (i === 1) {
-          console.log('[relogin] reloading discord page to apply token...');
-          await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+      const hasLoginInput = (await page.locator('input[name="email"], input[type="email"], input[type="password"]').count().catch(() => 0)) > 0;
+      if (hasLoginInput || u.includes('/login')) {
+        if (!reloaded) {
+          reloaded = true;
+          console.log('[relogin] discord redirected to login, reloading once to apply injected token...');
+          await page.goto('https://discord.com/channels/@me', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
           continue;
         }
-      } else if (u.includes('/channels/')) {
-        console.log(`[relogin] discord session active, url: ${u}`);
+        console.log('[relogin] discord token rejected (landed on login page)');
+        return false;
+      }
+      // 只有真正渲染出 Discord 侧边栏服务器导航或用户面板，才确认会话有效
+      const isAppLoaded = (await page.locator('[data-list-id="guildsnav"], nav[aria-label*="服务器"], nav[aria-label*="Servers"]').count().catch(() => 0)) > 0;
+      if (isAppLoaded) {
+        console.log(`[relogin] discord session verified active, url: ${u}`);
         return true;
       }
     }
-    console.log(`[relogin] discord pre-warm finished, url: ${page.url()}`);
-    return !page.url().includes('/login');
+    console.log(`[relogin] discord pre-warm timeout, url: ${page.url()}`);
+    return false;
   } catch (e) {
     console.log(`[relogin] discord pre-warm notice: ${e.message}`);
     return false;
